@@ -69,6 +69,17 @@ You can do this by running: `kubectl -n choreo-system scale deployment choreo-co
    bash ./install/add-default-dataplane.sh
    ```
 
+6. Run controller manager locally (for development):
+
+   To run the controller manager locally during development:
+
+   - Scale down the in-cluster controller manager deployment to zero replicas.
+   - Run the following command locally to start the controller manager:
+   
+   ```sh
+   kubectl get dataplane default-dataplane -n default-org -o json | jq --arg url "$(kubectl config view --raw -o jsonpath="{.clusters[?(@.name=='kind-choreo')].cluster.server}")" '.spec.kubernetesCluster.credentials.apiServerURL = $url' | kubectl apply -f -
+   ```
+
 ### Building and Running the Binaries
 
 This project comprises multiple binaries, mainly the `manager` binary and the `choreoctl` CLI tool.
