@@ -2,7 +2,7 @@ header:
   license:
     name: OpenChoreo
     content: |
-      Copyright 2025 The OpenChoreo Authors
+      Copyright {{YEAR}} The OpenChoreo Authors
       SPDX-License-Identifier: Apache-2.0
 
   paths:

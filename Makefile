@@ -23,7 +23,7 @@ install-license-eye:
 
 update-license-year:
 	@echo "Replacing '{{YEAR}}' with $$(date +%Y) in .licenserc.yaml..."
-	@sed -i '' -e 's/{{YEAR}}/'"$$\(date +%Y\)"'/g' .licenserc.yaml
+	@sed -i -e 's/{{YEAR}}/'"$$\(date +%Y\)"'/g' .licenserc.yaml
 	@echo "✅ Year updated in .licenserc.yaml"
 
 license-fix: install-license-eye update-license-year

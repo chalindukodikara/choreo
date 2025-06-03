@@ -19,9 +19,7 @@ jobs:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
           make install-license-eye
-          ls -A
           make update-license-year
-          sed -i "s/{{YEAR}}/$(date +%Y)/" .licenserc.yaml
           cat .licenserc.yaml
 
       - name: Run license header check
