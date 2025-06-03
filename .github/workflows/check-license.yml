@@ -15,25 +15,21 @@ jobs:
         uses: ./.github/actions/setup-go
 
       - name: Install license-eye
-        env:
-          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
           make install-license-eye
           make update-license-year
-          cat .licenserc.yaml
 
       - name: Run license header check
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
           echo "Running license header check..."
           license-eye header check || {
-            echo "/n"
-            echo "❌ License header check failed."
-            echo "/n"
-            echo "Please add the following header to the top of each Go file:"
-            echo "/n"
+            echo "\nPlease add the following header to the top of each Go file:\n"
+            echo
             echo "// Copyright $(date +%Y) The OpenChoreo Authors"
             echo "// SPDX-License-Identifier: Apache-2.0"
-            echo "/n"
+            echo
             echo "Run \`make license-fix\` locally to fix."
             exit 1
           }
