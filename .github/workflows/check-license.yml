@@ -17,7 +17,7 @@ jobs:
       - name: Install license-eye
         run: |
           make install-license-eye
-          make update-license-year
+          sed -i "s/{{YEAR}}/$(date +%Y)/" .licenserc.yaml
           cat .licenserc.yaml
 
       - name: Run license header check
