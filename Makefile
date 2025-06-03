@@ -16,16 +16,14 @@ include make/helm.mk
 
 .PHONY: license-check license-fix install-license-eye update-license-year
 
-CURRENT_YEAR := $(shell date +%Y)
-
 install-license-eye:
 	@echo "Installing license-eye..."
 	@go install github.com/apache/skywalking-eyes/cmd/license-eye@v0.7.0
-	@echo "✅ license-eye installed at $(LICENSE_EYE_BIN)"
+	@echo "✅ license-eye installed"
 
 update-license-year:
-	@echo "Replacing '{{YEAR}}' with $(CURRENT_YEAR) in .licenserc.yaml..."
-	@sed -i '' -e 's/{{YEAR}}/$(CURRENT_YEAR)/g' .licenserc.yaml
+	@echo "Replacing '{{YEAR}}' with $$(date +%Y) in .licenserc.yaml..."
+	@sed -i '' -e 's/{{YEAR}}/'"$$\(date +%Y\)"'/g' .licenserc.yaml
 	@echo "✅ Year updated in .licenserc.yaml"
 
 license-fix: install-license-eye update-license-year
