@@ -54,7 +54,7 @@ ALL_SRC := $(shell find $(ALL_PKG_DIRS) -type f -name '*.go' \
 	! -path './internal/dataplane/kubernetes/types/*' | sort)
 
 checklic:
-	@addlicense -c "The OpenChoreo Authors" -s=only .
+	@go run ./license-check/main.go -c "The OpenChoreo Authors" -l=apache $(ALL_SRC)
 
 checklicense:
 	@echo "Checking license headers in:"
