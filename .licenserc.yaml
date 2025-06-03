@@ -1,0 +1,18 @@
+header:
+  license:
+    name: OpenChoreo
+    content: |
+      Copyright {{YEAR}} The OpenChoreo Authors
+      SPDX-License-Identifier: Apache-2.0
+    pattern: |
+      Copyright \d{4} The OpenChoreo Authors
+      SPDX-License-Identifier: Apache-2.0
+
+  paths:
+    - '**/*.go'
+
+  paths-ignore:
+    - 'internal/dataplane/kubernetes/types/'
+
+  comment: on-failure
+  license-location-threshold: 20

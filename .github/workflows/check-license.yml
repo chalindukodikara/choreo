@@ -1,0 +1,36 @@
+name: License Header Check
+
+on:
+  push:
+  pull_request:
+
+jobs:
+  license-check:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Setup Go
+        uses: ./.github/actions/setup-go
+
+      - name: Install license-eye
+        run: |
+          make install-license-eye
+          make update-license-year
+
+      - name: Run license header check
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          echo "Running license header check..."
+          license-eye header check || {
+            echo "\nPlease add the following header to the top of each Go file:\n"
+            echo
+            echo "// Copyright $(date +%Y) The OpenChoreo Authors"
+            echo "// SPDX-License-Identifier: Apache-2.0"
+            echo
+            echo "Run \`make license-fix\` locally to fix."
+            exit 1
+          }
+
