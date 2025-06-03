@@ -1,3 +1,6 @@
+// Copyright 2025 The OpenChoreo Authors
+// SPDX-License-Identifier: Apache-2.0
+
 /*
  * Copyright (c) 2025, WSO2 Inc. (http://www.wso2.org) All Rights Reserved.
  *
