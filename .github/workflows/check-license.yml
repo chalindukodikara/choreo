@@ -14,14 +14,12 @@ jobs:
       - name: Setup Go
         uses: ./.github/actions/setup-go
 
-      - name: Check License Header
-        uses: apache/skywalking-eyes/header@main      # always prefer to use a revision instead of `main`.
-        with:
-          token: ${{ secrets.GITHUB_TOKEN }}
-
       - name: Install license-eye
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
           make install-license-eye
+          make update-license-year
           sed -i "s/{{YEAR}}/$(date +%Y)/" .licenserc.yaml
           cat .licenserc.yaml
 
