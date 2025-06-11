@@ -21,7 +21,8 @@ var (
 )
 
 var (
-	headerPattern = regexp.MustCompile(`^// Copyright (\d{4}) (.+)\n// SPDX-License-Identifier: (Apache-2.0|MIT)$`)
+	headerRegex = regexp.MustCompile(`^// Copyright (\d{4}) (.+)$`)
+	spdxRegex   = regexp.MustCompile(`^// SPDX-License-Identifier: (Apache-2.0|MIT)$`)
 )
 
 func getShortHeader(year, holder, license string) string {
@@ -41,7 +42,7 @@ func isGoFile(path string) bool {
 	return filepath.Ext(path) == ".go"
 }
 
-func hasValidShortHeader(file string) (bool, error) {
+func hasValidShortHeader(file string, expectedHolder, expectedLicense string) (bool, error) {
 	f, err := os.Open(file)
 	if err != nil {
 		return false, err
@@ -65,8 +66,25 @@ func hasValidShortHeader(file string) (bool, error) {
 		return false, nil
 	}
 
-	matched := headerPattern.MatchString(strings.Join(lines, "\n"))
-	return matched, nil
+	match1 := headerRegex.FindStringSubmatch(lines[0])
+	match2 := spdxRegex.FindStringSubmatch(lines[1])
+
+	if match1 == nil || match2 == nil {
+		return false, nil
+	}
+
+	// Validate copyright holder and license
+	year, holder := match1[1], match1[2]
+	license := match2[1]
+
+	if holder != expectedHolder || license != licenseIdentifier(expectedLicense) {
+		return false, nil
+	}
+
+	// Optional: check year matches current year (you can remove this if year can vary)
+	_ = year
+
+	return true, nil
 }
 
 func prependHeader(filePath, header string) error {
@@ -79,8 +97,8 @@ func prependHeader(filePath, header string) error {
 	return os.WriteFile(filePath, content, 0644)
 }
 
-func processFile(path string, header string) (updated bool, err error) {
-	ok, err := hasValidShortHeader(path)
+func processFile(path, header string, holder, license string) (updated bool, err error) {
+	ok, err := hasValidShortHeader(path, holder, license)
 	if err != nil {
 		return false, err
 	}
@@ -89,7 +107,7 @@ func processFile(path string, header string) (updated bool, err error) {
 	}
 
 	if *checkOnly {
-		return true, nil // mark as non-compliant
+		return true, nil // non-compliant
 	}
 
 	err = prependHeader(path, header)
@@ -99,7 +117,7 @@ func processFile(path string, header string) (updated bool, err error) {
 	return true, nil
 }
 
-func walkDir(dir string, header string) ([]string, error) {
+func walkDir(dir, header, holder, license string) ([]string, error) {
 	var nonCompliant []string
 	err := filepath.WalkDir(dir, func(path string, d os.DirEntry, err error) error {
 		if err != nil {
@@ -108,7 +126,7 @@ func walkDir(dir string, header string) ([]string, error) {
 		if d.IsDir() || !isGoFile(path) {
 			return nil
 		}
-		updated, err := processFile(path, header)
+		updated, err := processFile(path, header, holder, license)
 		if err != nil {
 			return err
 		}
@@ -130,7 +148,7 @@ Options:
 
 Examples:
   Check compliance:
-    go run main.go -check-only .
+    go run main.go -check-only -c "The OpenChoreo Authors" -l "apache" .
 
   Add headers:
     go run main.go -c="The OpenChoreo Authors" .`)
@@ -150,7 +168,7 @@ func main() {
 
 	var allNonCompliant []string
 	for _, dir := range flag.Args() {
-		files, err := walkDir(dir, header)
+		files, err := walkDir(dir, header, *copyrightHolder, *licenseType)
 		if err != nil {
 			fmt.Fprintf(os.Stderr, "Error walking directory %s: %v\n", dir, err)
 			os.Exit(1)
@@ -181,5 +199,5 @@ func main() {
 }
 
 func getCurrentYear() int {
-	return time.Now().Year() // or use time.Now().Year() if you want dynamic year
+	return time.Now().Year()
 }

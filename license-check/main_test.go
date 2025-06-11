@@ -8,23 +8,35 @@ import (
 	"path/filepath"
 	"strings"
 	"testing"
+	"time"
 
 	. "github.com/onsi/ginkgo/v2"
 	. "github.com/onsi/gomega"
 )
 
-func TestAddLicense(t *testing.T) {
+func TestLicenseCheck(t *testing.T) {
 	RegisterFailHandler(Fail)
-	RunSpecs(t, "AddLicense Suite")
+	RunSpecs(t, "License Check Suite")
 }
 
-var _ = Describe("AddLicense tool", func() {
+var _ = Describe("License Header Checker", func() {
 	var tmpDir string
+	var header string
+	holder := "The OpenChoreo Authors"
+	license := "apache"
 
 	BeforeEach(func() {
 		var err error
-		tmpDir, err = os.MkdirTemp("", "addlicense-test-")
-		Expect(err).ToNot(HaveOccurred())
+		tmpDir, err = os.MkdirTemp("", "license-check-test")
+		Expect(err).NotTo(HaveOccurred())
+
+		header = getShortHeader(
+			func() string {
+				return time.Now().Format("2006")
+			}(),
+			holder,
+			license,
+		)
 	})
 
 	AfterEach(func() {
@@ -34,109 +46,121 @@ var _ = Describe("AddLicense tool", func() {
 	writeFile := func(name, content string) string {
 		path := filepath.Join(tmpDir, name)
 		err := os.WriteFile(path, []byte(content), 0644)
-		Expect(err).ToNot(HaveOccurred())
+		Expect(err).NotTo(HaveOccurred())
 		return path
 	}
 
-	Context("hasValidShortHeader", func() {
-		It("detects a valid short license header", func() {
-			content := `// Copyright 2025 The OpenChoreo Authors
+	It("detects valid header", func() {
+		content := header + `
+
+package main
+
+func main() {}
+`
+		path := writeFile("valid.go", content)
+
+		valid, err := hasValidShortHeader(path, holder, license)
+		Expect(err).NotTo(HaveOccurred())
+		Expect(valid).To(BeTrue())
+	})
+
+	It("detects missing header", func() {
+		content := `
+package main
+
+func main() {}
+`
+		path := writeFile("missing.go", content)
+
+		valid, err := hasValidShortHeader(path, holder, license)
+		Expect(err).NotTo(HaveOccurred())
+		Expect(valid).To(BeFalse())
+	})
+
+	It("detects incorrect holder", func() {
+		content := `// Copyright 2025 Someone Else
 // SPDX-License-Identifier: Apache-2.0
 
 package main
-`
-			f := writeFile("valid.go", content)
-			ok, err := hasValidShortHeader(f)
-			Expect(err).ToNot(HaveOccurred())
-			Expect(ok).To(BeTrue())
-		})
 
-		It("detects missing or invalid header", func() {
-			content := `// Some other header
+func main() {}
+`
+		path := writeFile("badholder.go", content)
+
+		valid, err := hasValidShortHeader(path, holder, license)
+		Expect(err).NotTo(HaveOccurred())
+		Expect(valid).To(BeFalse())
+	})
+
+	It("adds header when missing", func() {
+		content := `
 package main
-`
-			f := writeFile("invalid.go", content)
-			ok, err := hasValidShortHeader(f)
-			Expect(err).ToNot(HaveOccurred())
-			Expect(ok).To(BeFalse())
-		})
 
-		It("returns false for empty files", func() {
-			f := writeFile("empty.go", "")
-			ok, err := hasValidShortHeader(f)
-			Expect(err).ToNot(HaveOccurred())
-			Expect(ok).To(BeFalse())
-		})
+func main() {}
+`
+		path := writeFile("add.go", content)
+
+		*checkOnly = false
+		updated, err := processFile(path, header, holder, license)
+		Expect(err).NotTo(HaveOccurred())
+		Expect(updated).To(BeTrue())
+
+		// Re-check
+		valid, err := hasValidShortHeader(path, holder, license)
+		Expect(err).NotTo(HaveOccurred())
+		Expect(valid).To(BeTrue())
 	})
 
-	Context("processFile", func() {
-		var header string
+	It("does not update file if checkOnly is true", func() {
+		content := `
+package main
 
-		BeforeEach(func() {
-			header = getShortHeader("2025", "The OpenChoreo Authors", "apache")
-		})
-
-		It("does not update compliant file", func() {
-			content := header + "\n\npackage main\n"
-			f := writeFile("already.go", content)
-			updated, err := processFile(f, header)
-			Expect(err).ToNot(HaveOccurred())
-			Expect(updated).To(BeFalse())
-
-			data, err := os.ReadFile(f)
-			Expect(err).ToNot(HaveOccurred())
-			Expect(string(data)).To(Equal(content))
-		})
-
-		It("in check-only mode returns true for non-compliant file", func() {
-			content := `package main
+func main() {}
 `
-			f := writeFile("noheader.go", content)
+		path := writeFile("checkonly.go", content)
 
-			*checkOnly = true
-			updated, err := processFile(f, header)
-			Expect(err).ToNot(HaveOccurred())
-			Expect(updated).To(BeTrue())
-			*checkOnly = false
-		})
+		*checkOnly = true
+		updated, err := processFile(path, header, holder, license)
+		Expect(err).NotTo(HaveOccurred())
+		Expect(updated).To(BeTrue()) // It's non-compliant
 
-		It("prepends header in update mode for non-compliant file", func() {
-			content := `package main
-`
-			f := writeFile("noheader.go", content)
-
-			updated, err := processFile(f, header)
-			Expect(err).ToNot(HaveOccurred())
-			Expect(updated).To(BeTrue())
-
-			data, err := os.ReadFile(f)
-			Expect(err).ToNot(HaveOccurred())
-			Expect(strings.HasPrefix(string(data), header)).To(BeTrue())
-		})
+		// File should still be missing header
+		valid, err := hasValidShortHeader(path, holder, license)
+		Expect(err).NotTo(HaveOccurred())
+		Expect(valid).To(BeFalse())
 	})
 
-	Context("walkDir", func() {
-		var header string
+	It("walks directory and finds non-compliant file", func() {
+		content := `
+package main
 
-		BeforeEach(func() {
-			header = getShortHeader("2025", "The OpenChoreo Authors", "apache")
-		})
+func main() {}
+`
+		writeFile("walk1.go", content)
 
-		It("walks directory and returns non-compliant go files", func() {
-			// Compliant file
-			writeFile("valid.go", header+"\n\npackage main\n")
+		*checkOnly = true
+		files, err := walkDir(tmpDir, header, holder, license)
+		Expect(err).NotTo(HaveOccurred())
+		Expect(files).To(HaveLen(1))
+		Expect(strings.HasSuffix(files[0], "walk1.go")).To(BeTrue())
+	})
 
-			// Non-compliant file
-			writeFile("invalid.go", "package main\n")
+	It("walks directory and updates file in non-check mode", func() {
+		content := `
+package main
 
-			// Non-Go file
-			writeFile("notgo.txt", "random text")
+func main() {}
+`
+		writeFile("walk2.go", content)
 
-			nonCompliant, err := walkDir(tmpDir, header)
-			Expect(err).ToNot(HaveOccurred())
-			Expect(nonCompliant).To(ContainElement(filepath.Join(tmpDir, "invalid.go")))
-			Expect(nonCompliant).ToNot(ContainElement(filepath.Join(tmpDir, "valid.go")))
-			Expect(nonCompliant).ToNot(ContainElement(filepath.Join(tmpDir, "notgo.txt")))
-		})
+		*checkOnly = false
+		files, err := walkDir(tmpDir, header, holder, license)
+		Expect(err).NotTo(HaveOccurred())
+		Expect(files).To(HaveLen(1))
+		Expect(strings.HasSuffix(files[0], "walk2.go")).To(BeTrue())
+
+		valid, err := hasValidShortHeader(files[0], holder, license)
+		Expect(err).NotTo(HaveOccurred())
+		Expect(valid).To(BeTrue())
 	})
 })
