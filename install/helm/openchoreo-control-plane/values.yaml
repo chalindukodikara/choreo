@@ -508,8 +508,8 @@ asgardeoThunder:
       port: 8090
       httpOnly: true
     gateClient:
-      hostname: "thunder.openchoreo.localhost"
-      port: 7007
+      hostname: "localhost"
+      port: 8090
       scheme: "http"
       loginPath: "/signin"
       errorPath: "/error"
@@ -540,8 +540,8 @@ asgardeoThunder:
     client:
       base: "/signin"
     server:
-      hostname: "thunder.openchoreo.localhost"
-      port: 7007
+      hostname: "localhost"
+      port: 8090
       httpOnly: true
   persistence:
     database:
