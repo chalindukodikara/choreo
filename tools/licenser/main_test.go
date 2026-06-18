@@ -5,6 +5,7 @@ package main
 
 import (
 	"os"
+	"os/exec"
 	"path/filepath"
 	"strings"
 	"testing"
@@ -39,11 +40,28 @@ var _ = Describe("License Header Checker", func() {
 		_ = os.RemoveAll(tmpDir)
 	})
 
+	withWorkingDir := func(dir string, fn func()) {
+		previousDir, err := os.Getwd()
+		Expect(err).NotTo(HaveOccurred())
+		Expect(os.Chdir(dir)).To(Succeed())
+		defer func() {
+			Expect(os.Chdir(previousDir)).To(Succeed())
+		}()
+
+		fn()
+	}
+
 	writeFile := func(name, content string) string {
 		p := filepath.Join(tmpDir, name)
 		Expect(os.MkdirAll(filepath.Dir(p), 0o755)).To(Succeed())
 		Expect(os.WriteFile(p, []byte(content), 0o644)).To(Succeed())
 		return p
+	}
+
+	runGit := func(args ...string) {
+		cmd := exec.Command("git", append([]string{"-C", tmpDir}, args...)...)
+		out, err := cmd.CombinedOutput()
+		Expect(err).NotTo(HaveOccurred(), string(out))
 	}
 
 	// --- isGoFile ---
@@ -115,7 +133,7 @@ var _ = Describe("License Header Checker", func() {
 			Expect(ok).To(BeTrue())
 		})
 
-		It("accepts a valid header from a previous year", func() {
+		It("accepts a valid header from a previous year for a non-new file", func() {
 			oldHeader := shortHeader("2020", holder)
 			content := oldHeader + "\n\npackage main\n"
 			path := writeFile("oldyear.go", content)
@@ -123,6 +141,55 @@ var _ = Describe("License Header Checker", func() {
 			ok, err := hasValidHeader(path, holder)
 			Expect(err).NotTo(HaveOccurred())
 			Expect(ok).To(BeTrue())
+		})
+
+		It("accepts a valid header from a previous year for a tracked existing file", func() {
+			runGit("init")
+			oldHeader := shortHeader("2020", holder)
+			content := oldHeader + "\n\npackage main\n"
+			path := writeFile("existing.go", content)
+			runGit("add", "existing.go")
+			runGit("-c", "user.name=Test User", "-c", "user.email=test@example.com", "commit", "-m", "add existing file")
+
+			ok, err := hasValidHeader(path, holder)
+			Expect(err).NotTo(HaveOccurred())
+			Expect(ok).To(BeTrue())
+		})
+
+		It("rejects a previous-year header for a new untracked file", func() {
+			runGit("init")
+			oldHeader := shortHeader("2020", holder)
+			content := oldHeader + "\n\npackage main\n"
+			path := writeFile("newfile.go", content)
+
+			ok, err := hasValidHeader(path, holder)
+			Expect(err).NotTo(HaveOccurred())
+			Expect(ok).To(BeFalse())
+		})
+
+		It("rejects a previous-year header for a staged new file", func() {
+			runGit("init")
+			oldHeader := shortHeader("2020", holder)
+			content := oldHeader + "\n\npackage main\n"
+			path := writeFile("stagednew.go", content)
+			runGit("add", "stagednew.go")
+
+			ok, err := hasValidHeader(path, holder)
+			Expect(err).NotTo(HaveOccurred())
+			Expect(ok).To(BeFalse())
+		})
+
+		It("rejects a previous-year header for a nested new file passed as a relative path", func() {
+			runGit("init")
+			oldHeader := shortHeader("2020", holder)
+			content := oldHeader + "\n\npackage main\n"
+			writeFile("tools/licenser/new.go", content)
+
+			withWorkingDir(tmpDir, func() {
+				ok, err := hasValidHeader("./tools/licenser/new.go", holder)
+				Expect(err).NotTo(HaveOccurred())
+				Expect(ok).To(BeFalse())
+			})
 		})
 
 		It("accepts header with leading blank lines", func() {
@@ -238,6 +305,24 @@ var _ = Describe("License Header Checker", func() {
 		It("rejects file that starts with code before copyright", func() {
 			content := "package main\n// Copyright 2025 The OpenChoreo Authors\n// SPDX-License-Identifier: Apache-2.0\n"
 			path := writeFile("codebeforecopyright.go", content)
+
+			ok, err := hasValidHeader(path, holder)
+			Expect(err).NotTo(HaveOccurred())
+			Expect(ok).To(BeFalse())
+		})
+
+		It("detects a valid Python header with current year", func() {
+			content := "# Copyright " + currentYear + " The OpenChoreo Authors\n# SPDX-License-Identifier: Apache-2.0\n\nimport logging\n"
+			path := writeFile("valid.py", content)
+
+			ok, err := hasValidHeader(path, holder)
+			Expect(err).NotTo(HaveOccurred())
+			Expect(ok).To(BeTrue())
+		})
+
+		It("rejects a Python header with slash comments", func() {
+			content := header + "\n\nimport logging\n"
+			path := writeFile("slashcomment.py", content)
 
 			ok, err := hasValidHeader(path, holder)
 			Expect(err).NotTo(HaveOccurred())
@@ -426,6 +511,36 @@ var _ = Describe("License Header Checker", func() {
 				Expect(strings.Count(string(content), "SPDX-License-Identifier")).To(Equal(1))
 			})
 
+			It("adds a hash-comment header to a Python file", func() {
+				original := "import logging\n"
+				path := writeFile("add.py", original)
+
+				updated, err := process(path, header, holder, true)
+				Expect(err).NotTo(HaveOccurred())
+				Expect(updated).To(BeTrue())
+
+				content, err := os.ReadFile(path)
+				Expect(err).NotTo(HaveOccurred())
+				Expect(string(content)).To(HavePrefix("# Copyright " + currentYear + " The OpenChoreo Authors\n# SPDX-License-Identifier: Apache-2.0\n\n"))
+				Expect(string(content)).To(HaveSuffix(original))
+			})
+
+			It("replaces a slash-comment header in a Python file", func() {
+				code := "import logging\n"
+				bad := header + "\n\n" + code
+				path := writeFile("replace.py", bad)
+
+				updated, err := process(path, header, holder, true)
+				Expect(err).NotTo(HaveOccurred())
+				Expect(updated).To(BeTrue())
+
+				content, err := os.ReadFile(path)
+				Expect(err).NotTo(HaveOccurred())
+				Expect(string(content)).To(HavePrefix("# Copyright " + currentYear + " The OpenChoreo Authors\n# SPDX-License-Identifier: Apache-2.0\n\n"))
+				Expect(strings.Count(string(content), "Copyright")).To(Equal(1))
+				Expect(string(content)).To(HaveSuffix(code))
+			})
+
 			It("replaces header with both wrong holder and wrong license", func() {
 				bad := "// Copyright 2025 Wrong Corp\n// SPDX-License-Identifier: MIT\n\npackage main\n"
 				path := writeFile("bothwrong.go", bad)
@@ -570,16 +685,24 @@ var _ = Describe("License Header Checker", func() {
 			Expect(ok).To(BeTrue())
 		})
 
-		It("skips non-Go files", func() {
+		It("skips unsupported non-source files", func() {
 			writeFile("readme.md", "# README")
 			writeFile("config.yaml", "key: value")
-			writeFile("script.py", "print('hello')")
 			writeFile("main.go", "package main\n")
 
 			files, err := walk(tmpDir, header, holder, false)
 			Expect(err).NotTo(HaveOccurred())
 			Expect(files).To(HaveLen(1))
 			Expect(files[0]).To(HaveSuffix("main.go"))
+		})
+
+		It("includes Python files", func() {
+			writeFile("script.py", "print('hello')\n")
+
+			files, err := walk(tmpDir, header, holder, false)
+			Expect(err).NotTo(HaveOccurred())
+			Expect(files).To(HaveLen(1))
+			Expect(files[0]).To(HaveSuffix("script.py"))
 		})
 
 		It("recurses into nested directories", func() {

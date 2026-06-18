@@ -14,17 +14,26 @@ ALL_GO_FILES := $(shell \
 		! -path '**/mocks/*' \
 	| sort)
 
+# Agent Python source files. Keep this scoped to .py files so YAML, text,
+# templates, lockfiles, and other agent assets are not passed to the licenser.
+AGENT_PY_FILES := $(shell \
+	find ./agents -type f -name '*.py' \
+		! -path '*/.venv/*' \
+	| sort)
+
+LICENSE_FILES := $(ALL_GO_FILES) $(AGENT_PY_FILES)
+
 # Path to your tool (update if different)
 LICENSE_TOOL := go run ./tools/licenser/main.go
 LICENSE_HOLDER := "The OpenChoreo Authors"
 
 .PHONY: license-check
-license-check: ## Check all Go files for license headers
-	@CHECK_ONLY=1 $(LICENSE_TOOL) -check-only -c $(LICENSE_HOLDER) $(ALL_GO_FILES)
+license-check: ## Check Go files and agent Python files for license headers
+	@CHECK_ONLY=1 $(LICENSE_TOOL) -check-only -c $(LICENSE_HOLDER) $(LICENSE_FILES)
 
 .PHONY: license-fix
-license-fix: ## Add license headers to all Go files
-	@$(LICENSE_TOOL) -c $(LICENSE_HOLDER) $(ALL_GO_FILES)
+license-fix: ## Add license headers to Go files and agent Python files
+	@$(LICENSE_TOOL) -c $(LICENSE_HOLDER) $(LICENSE_FILES)
 
 # Binary file extensions to exclude from newline checks
 BINARY_EXTENSIONS := png jpg jpeg gif ico pdf zip tar gz tgz bin exe so dylib dll woff woff2 ttf eot jar war
@@ -73,10 +82,10 @@ golangci-lint-fix: golangci-lint ## Run golangci-lint with fix option
 	$(GOLANGCI_LINT) run --fix
 
 .PHONY: lint
-lint: golangci-lint-check license-check newline-check ## Run golangci-lint linter, licenser, and newline check
+lint: golangci-lint-check license-check newline-check ## Run Go linting, license checks for Go/agent Python files, and newline checks
 
 .PHONY: lint-fix
-lint-fix: golangci-lint-fix license-fix newline-fix ## Run golangci-lint linter, licenser, and newline fix to perform fixes
+lint-fix: golangci-lint-fix license-fix newline-fix ## Fix Go linting, license headers for Go/agent Python files, and missing newlines
 
 # Individual getting-started sample files that compose all.yaml (order matters)
 GETTING_STARTED_DIR := samples/getting-started
