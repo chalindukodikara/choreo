@@ -1,0 +1,146 @@
+# Rootless Dockerfile/Containerfile build using Buildah,
+# with optional registry-based layer caching.
+#
+# Based on containerfile-build.yaml (buildah rootless, no caching).
+# Adds: build-cache parameter, registries.conf for insecure HTTP cache,
+# --layers + --cache-from / --cache-to / --cache-ttl for layer reuse.
+#
+# When build-cache is deployed: probe succeeds → caching enabled automatically.
+# When build-cache is absent: probe fails → builds proceed without cache.
+# When build-cache is "none": probe skipped → caching disabled explicitly.
+#
+# Cache key: build-cache/buildah/<image-name>:buildcache (scoped per component).
+#
+# Prerequisites:
+#   - Kubernetes 1.33+ with UserNamespacesSupport (GA, enabled by default)
+#   - containerd 2.x as container runtime
+#
+# Output: docker-archive tarball at /mnt/vol/app-image.tar
+apiVersion: argoproj.io/v1alpha1
+kind: ClusterWorkflowTemplate
+metadata:
+  name: containerfile-build-buildah-claude
+spec:
+  templates:
+    - name: build-image
+      podSpecPatch: '{"hostUsers": false}'
+      inputs:
+        parameters:
+          - name: git-revision
+          - name: build-env
+          - name: build-args
+          - name: build-cache
+            default: ""
+      volumes:
+        - name: storage
+          emptyDir:
+            sizeLimit: 10Gi
+      container:
+        image: quay.io/buildah/stable:v1.43.0
+        command:
+          - sh
+          - -c
+        args:
+          - |-
+            set -e
+
+            WORKDIR="/mnt/vol/source"
+            IMAGE_NAME="{{workflow.parameters.image-name}}"
+            IMAGE="${IMAGE_NAME}:{{workflow.parameters.image-tag}}-{{inputs.parameters.git-revision}}"
+            DOCKER_CONTEXT="{{workflow.parameters.docker-context}}"
+            DOCKERFILE_PATH="{{workflow.parameters.dockerfile-path}}"
+            BUILD_ENV_JSON='{{inputs.parameters.build-env}}'
+            BUILD_ARGS_JSON='{{inputs.parameters.build-args}}'
+            CACHE_REGISTRY="{{inputs.parameters.build-cache}}"
+
+            echo ">> [buildah] Image: $IMAGE"
+            echo ">> Dockerfile: $DOCKERFILE_PATH"
+            echo ">> Docker context: $DOCKER_CONTEXT"
+
+            if [ ! -f "$WORKDIR/$DOCKERFILE_PATH" ]; then
+              echo ">> Error: Dockerfile not found at: '$DOCKERFILE_PATH'"
+              echo ">> Repository contents:"
+              ls -la "$WORKDIR/"
+              exit 1
+            fi
+
+            if [ ! -d "$WORKDIR/$DOCKER_CONTEXT" ]; then
+              echo ">> Error: Docker build context directory not found: '$DOCKER_CONTEXT'"
+              echo ">> Repository contents:"
+              ls -la "$WORKDIR/"
+              exit 1
+            fi
+
+            # --- Storage configuration (overlay via user namespaces) ---
+            mkdir -p /storage/run /storage/graph
+            cat > /tmp/storage.conf <<'STORAGEEOF'
+            [storage]
+            driver = "overlay"
+            runroot = "/storage/run"
+            graphroot = "/storage/graph"
+            rootless_storage_path = "/storage/graph"
+            [storage.options]
+            pull_options = {enable_partial_images = "true", use_hard_links = "false", ostree_repos=""}
+            [storage.options.overlay]
+            STORAGEEOF
+
+            export CONTAINERS_STORAGE_CONF=/tmp/storage.conf
+
+            dnf install -y --setopt=install_weak_deps=False jq > /dev/null 2>&1 || true
+
+            ENV_ARGS=""
+            if [ -n "$BUILD_ENV_JSON" ] && [ "$BUILD_ENV_JSON" != "[]" ]; then
+              ENV_ARGS=$(echo "$BUILD_ENV_JSON" | \
+                jq -r '.[] | "--env \(.name)=\(.value)"' | \
+                tr '\n' ' ')
+            fi
+
+            BUILD_ARG_FLAGS=""
+            if [ -n "$BUILD_ARGS_JSON" ] && [ "$BUILD_ARGS_JSON" != "[]" ]; then
+              BUILD_ARG_FLAGS=$(echo "$BUILD_ARGS_JSON" | \
+                jq -r '.[] | "--build-arg \(.name)=\(.value)"' | \
+                tr '\n' ' ')
+            fi
+
+            # --- Layer cache configuration ---
+            CACHE_ARGS=""
+            if [ -n "$CACHE_REGISTRY" ] && [ "$CACHE_REGISTRY" != "none" ]; then
+              if curl -sf --max-time 3 -o /dev/null "http://${CACHE_REGISTRY}/v2/" 2>/dev/null; then
+                CACHE_REF="${CACHE_REGISTRY}/build-cache/buildah/${IMAGE_NAME}"
+                CACHE_ARGS="--layers --cache-from=${CACHE_REF} --cache-to=${CACHE_REF} --cache-ttl=168h"
+                cp /etc/containers/registries.conf /tmp/registries.conf 2>/dev/null || true
+                cat >> /tmp/registries.conf <<REGEOF
+
+            [[registry]]
+            location = "${CACHE_REGISTRY}"
+            insecure = true
+            REGEOF
+                export CONTAINERS_REGISTRIES_CONF=/tmp/registries.conf
+                echo ">> Layer cache: ${CACHE_REF}"
+              else
+                echo ">> Cache registry not reachable at ${CACHE_REGISTRY}, building without cache"
+              fi
+            fi
+
+            echo ">> Building image with Buildah (overlay driver, user namespace)"
+            buildah build \
+              --isolation chroot \
+              -t "$IMAGE" \
+              -f "$WORKDIR/$DOCKERFILE_PATH" \
+              $ENV_ARGS \
+              $BUILD_ARG_FLAGS \
+              $CACHE_ARGS \
+              "$WORKDIR/$DOCKER_CONTEXT"
+
+            echo ">> Image built successfully"
+            echo ">> Saving image as docker-archive tarball"
+            buildah push "$IMAGE" "docker-archive:/mnt/vol/app-image.tar:$IMAGE"
+            echo ">> Image saved to /mnt/vol/app-image.tar"
+        securityContext:
+          runAsUser: 1000
+          runAsGroup: 1000
+        volumeMounts:
+          - mountPath: /mnt/vol
+            name: workspace
+          - mountPath: /storage
+            name: storage

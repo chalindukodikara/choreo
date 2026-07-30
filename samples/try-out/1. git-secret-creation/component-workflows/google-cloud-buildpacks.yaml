@@ -1,0 +1,95 @@
+apiVersion: openchoreo.dev/v1alpha1
+kind: ComponentWorkflow
+metadata:
+  name: google-cloud-buildpacks
+  namespace: default
+spec:
+  schema:
+    parameters: { }
+    systemParameters:
+      repository:
+        url: string | description="Git repository URL"
+        secretRef: string | description="Secret reference name for Git credentials"
+        revision:
+          branch: string | default=main description="Git branch to checkout"
+          commit: string | description="Git commit SHA or reference (optional, defaultsto latest)"
+        appPath: string | default=. description="Path to the application directory within the repository"
+  resources:
+    - id: git-secret
+      template:
+        apiVersion: external-secrets.io/v1
+        kind: ExternalSecret
+        metadata:
+          name: ${metadata.workflowRunName}-git-secret
+          namespace: ${metadata.namespace}
+        spec:
+          refreshInterval: 15s
+          secretStoreRef:
+            kind: ClusterSecretStore
+            name: openbao
+          target:
+            name: ${metadata.workflowRunName}-git-secret
+            creationPolicy: Owner
+            template:
+              type: ${secretRef.type}
+          data:
+            - secretKey: ${secretRef.key}
+              remoteRef:
+                key: ${secretRef.remoteKey}
+                property: ${secretRef.property}
+    - id: registry-push-secret
+      template:
+        apiVersion: external-secrets.io/v1
+        kind: ExternalSecret
+        metadata:
+          name: ${metadata.workflowRunName}-registry-push-secret
+          namespace: ${metadata.namespace}
+        spec:
+          data:
+            - remoteRef:
+                key: registry-push-secret
+              secretKey: registrysecret
+          refreshInterval: 15s
+          secretStoreRef:
+            kind: ClusterSecretStore
+            name: openbao
+          target:
+            creationPolicy: Owner
+            name: ${metadata.workflowRunName}-registry-push-secret
+            template:
+              data:
+                .dockerconfigjson: ""
+              type: kubernetes.io/dockerconfigjson
+  runTemplate:
+    apiVersion: argoproj.io/v1alpha1
+    kind: Workflow
+    metadata:
+      name: ${metadata.workflowRunName}
+      namespace: openchoreo-ci-${metadata.namespaceName}
+    spec:
+      arguments:
+        parameters:
+          - name: component-name
+            value: ${metadata.componentName}
+          - name: project-name
+            value: ${metadata.projectName}
+          - name: git-repo
+            value: ${systemParameters.repository.url}
+          - name: branch
+            value: ${systemParameters.repository.revision.branch}
+          - name: commit
+            value: ${systemParameters.repository.revision.commit}
+          - name: app-path
+            value: ${systemParameters.repository.appPath}
+          - name: image-name
+            value: ${metadata.projectName}-${metadata.componentName}-image
+          - name: image-tag
+            value: v1
+          - name: git-secret
+            value: ${metadata.workflowRunName}-git-secret
+          - name: registry-push-secret
+            value: ${metadata.workflowRunName}-registry-push-secret
+      serviceAccountName: workflow-sa
+      workflowTemplateRef:
+        clusterScope: true
+        name: google-cloud-buildpacks

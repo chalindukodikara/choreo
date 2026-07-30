@@ -1,0 +1,65 @@
+# Component that builds from AWS CodeCommit using HTTPS Git credentials (basic auth).
+apiVersion: openchoreo.dev/v1alpha1
+kind: Component
+metadata:
+  name: codecommit-greeter-basic
+  namespace: default
+spec:
+  owner:
+    projectName: default
+
+  componentType:
+    kind: ClusterComponentType
+    name: deployment/service
+
+  autoDeploy: true
+
+  workflow:
+    kind: ClusterWorkflow
+    name: dockerfile-builder
+    parameters:
+      repository:
+        url: "https://git-codecommit.us-east-1.amazonaws.com/v1/repos/aws-private-repo"
+        secretRef: "aws-codecommit-basic-auth"
+        revision:
+          branch: "main"
+        appPath: "/service-go-greeter"
+      docker:
+        context: "/service-go-greeter"
+        filePath: "/service-go-greeter/Dockerfile"
+
+  parameters:
+    exposed: true
+    replicas: 1
+    port: 8080
+    resources:
+      requests:
+        cpu: "100m"
+        memory: "128Mi"
+      limits:
+        cpu: "500m"
+        memory: "256Mi"
+
+---
+apiVersion: openchoreo.dev/v1alpha1
+kind: WorkflowRun
+metadata:
+  name: codecommit-greeter-basic-build-01
+  namespace: default
+  labels:
+    openchoreo.dev/project: "default"
+    openchoreo.dev/component: "codecommit-greeter-basic"
+spec:
+  workflow:
+    kind: ClusterWorkflow
+    name: dockerfile-builder
+    parameters:
+      repository:
+        url: "https://git-codecommit.us-east-1.amazonaws.com/v1/repos/aws-private-repo"
+        secretRef: "aws-codecommit-basic-auth"
+        revision:
+          branch: "main"
+        appPath: "/service-go-greeter"
+      docker:
+        context: "/service-go-greeter"
+        filePath: "/service-go-greeter/Dockerfile"

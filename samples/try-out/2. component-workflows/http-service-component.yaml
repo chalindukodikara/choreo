@@ -1,0 +1,64 @@
+# Sample: HTTP Service Component using the default deployment/service ComponentType
+#
+# This sample demonstrates:
+# - Using the default deployment/service ComponentType
+# - Defining a Workload with endpoints for service discovery
+# - Environment-specific resource overrides via ReleaseBinding
+
+---
+apiVersion: openchoreo.dev/v1alpha1
+kind: Component
+metadata:
+  name: demo-app-http-service
+  namespace: default
+spec:
+  owner:
+    projectName: default
+  autoDeploy: true
+  componentType: deployment/service
+
+---
+apiVersion: openchoreo.dev/v1alpha1
+kind: Workload
+metadata:
+  name: demo-app-http-service-workload
+  namespace: default
+spec:
+  owner:
+    projectName: default
+    componentName: demo-app-http-service
+
+  endpoints:
+    http:
+      type: HTTP
+      port: 9090
+
+  containers:
+    main:
+      image: "ghcr.io/openchoreo/samples/greeter-service:latest"
+      args:
+        - --port
+        - "9090"
+
+---
+apiVersion: openchoreo.dev/v1alpha1
+kind: ReleaseBinding
+metadata:
+  name: demo-app-http-service-development
+  namespace: default
+spec:
+  owner:
+    projectName: default
+    componentName: demo-app-http-service
+
+  environment: development
+
+  componentTypeEnvOverrides:
+    replicas: 2
+    resources:
+      requests:
+        cpu: "50m"
+        memory: "128Mi"
+      limits:
+        cpu: "200m"
+        memory: "256Mi"

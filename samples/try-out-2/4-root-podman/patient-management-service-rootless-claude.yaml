@@ -1,0 +1,43 @@
+apiVersion: openchoreo.dev/v1alpha1
+kind: Component
+metadata:
+  name: patient-management-service-rootless-claude
+  namespace: default
+spec:
+  owner:
+    projectName: default
+
+  componentType:
+    kind: ClusterComponentType
+    name: deployment/service
+
+  autoDeploy: true
+
+  workflow:
+    kind: ClusterWorkflow
+    name: ballerina-buildpack-builder-rootless-claude
+    parameters:
+      repository:
+        url: "https://github.com/openchoreo/sample-workloads"
+        revision:
+          branch: "main"
+        appPath: "/service-ballerina-patient-management"
+
+---
+apiVersion: openchoreo.dev/v1alpha1
+kind: WorkflowRun
+metadata:
+  name: patient-management-service-rootless-claude-build-05
+  labels:
+    openchoreo.dev/project: "default"
+    openchoreo.dev/component: "patient-management-service-rootless-claude"
+spec:
+  workflow:
+    kind: ClusterWorkflow
+    name: ballerina-buildpack-builder-rootless-claude
+    parameters:
+      repository:
+        url: "https://github.com/openchoreo/sample-workloads"
+        revision:
+          branch: "main"
+        appPath: "/service-ballerina-patient-management"

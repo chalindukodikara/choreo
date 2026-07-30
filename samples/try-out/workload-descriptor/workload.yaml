@@ -1,0 +1,72 @@
+# OpenChoreo Workload Descriptor
+# This file defines how your workload exposes endpoints and connects to other services.
+# It sits alongside your source code and gets converted to a Workload Custom Resource (CR).
+apiVersion: openchoreo.dev/v1alpha1
+
+# Basic metadata for the workload
+metadata:
+  # +required Name of the workload
+  name: greeter-service
+
+# +optional Incoming connection details for the component
+# Endpoints define the network interfaces that this workload exposes to other services
+endpoints:
+  - # +required Unique name for the endpoint
+    # This name will be used when generating the managed API and as the key in the CR map
+    name: reading-list-api
+    # +required Numeric port value that gets exposed via the endpoint
+    port: 5000
+    # +required Type of traffic that the endpoint is accepting
+    # Allowed values: REST, GraphQL, gRPC, TCP, UDP, HTTP, Websocket
+    type: REST
+    # +optional The path to the schema definition file
+    # This is applicable to REST, GraphQL, and gRPC endpoint types
+    # The path should be relative to the workload.yaml file location
+    schemaFile: openapi.yaml
+
+configurations:
+  # Environment variables
+  env:
+    - name: LOG_LEVEL
+      value: info
+
+    - name: APP_ENV
+      value: production
+
+    - name: MAX_CONNECTIONS
+      value: "100"
+
+    # Secret reference - value from Kubernetes secret
+    - name: API_SECRET
+      valueFrom:
+        secretKeyRef:
+          name: app-secrets
+          key: api-secret
+
+    - name: DATABASE_PASSWORD
+      valueFrom:
+        secretKeyRef:
+          name: db-credentials
+          key: password
+  # File configurations
+  files:
+    # Inline file content
+    - name: app-config
+      mountPath: /etc/config/app.json
+      value: |
+        {
+          "feature_flags": {
+            "new_feature": true
+          }
+        }
+
+    # File from path (relative to workload.yaml)
+    - name: tls-cert
+      mountPath: /etc/ssl/certs/app.crt
+      valueFrom:
+        path: ./certs/app.crt
+
+
+
+
+

@@ -1,0 +1,1227 @@
+openapi: 3.0.3
+info:
+  title: OpenChoreo CI Adapter API
+  version: 0.1.0
+  description: Standard internal API implemented by CI module adapters and called by the OpenChoreo API server.
+servers:
+  - url: /adapter/v1
+security:
+  - bearerAuth: []
+tags:
+  - name: Operations
+  - name: WorkflowRuns
+  - name: Source
+  - name: Webhooks
+paths:
+  /healthz:
+    get:
+      tags: [Operations]
+      operationId: getHealth
+      summary: Health check
+      security: []
+      responses:
+        "200":
+          description: Adapter is healthy.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/HealthResponse"
+        "503":
+          $ref: "#/components/responses/Unavailable"
+
+  /capabilities:
+    get:
+      tags: [Operations]
+      operationId: getCapabilities
+      summary: Get adapter capabilities
+      responses:
+        "200":
+          description: Adapter capabilities.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/AdapterCapabilities"
+        "500":
+          $ref: "#/components/responses/InternalError"
+
+  /workflowruns/{namespaceName}/{runName}/status:
+    get:
+      tags: [WorkflowRuns]
+      operationId: getWorkflowRunStatus
+      summary: Get workflow run status
+      parameters:
+        - $ref: "#/components/parameters/NamespaceName"
+        - $ref: "#/components/parameters/RunName"
+      responses:
+        "200":
+          description: Normalized workflow run status.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/WorkflowRunStatusResponse"
+        "403":
+          $ref: "#/components/responses/Forbidden"
+        "404":
+          $ref: "#/components/responses/NotFound"
+        "500":
+          $ref: "#/components/responses/InternalError"
+        "502":
+          $ref: "#/components/responses/UpstreamError"
+
+  /workflowruns/{namespaceName}/{runName}/tasks:
+    get:
+      tags: [WorkflowRuns]
+      operationId: listWorkflowRunTasks
+      summary: List workflow run tasks
+      parameters:
+        - $ref: "#/components/parameters/NamespaceName"
+        - $ref: "#/components/parameters/RunName"
+      responses:
+        "200":
+          description: Normalized task list.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/TaskListResponse"
+        "403":
+          $ref: "#/components/responses/Forbidden"
+        "404":
+          $ref: "#/components/responses/NotFound"
+        "500":
+          $ref: "#/components/responses/InternalError"
+        "502":
+          $ref: "#/components/responses/UpstreamError"
+
+  /workflowruns/{namespaceName}/{runName}/logs/streams:
+    get:
+      tags: [WorkflowRuns]
+      operationId: listWorkflowRunLogStreams
+      summary: List available log streams
+      parameters:
+        - $ref: "#/components/parameters/NamespaceName"
+        - $ref: "#/components/parameters/RunName"
+        - $ref: "#/components/parameters/TaskName"
+      responses:
+        "200":
+          description: Available log streams.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/LogStreamListResponse"
+        "403":
+          $ref: "#/components/responses/Forbidden"
+        "404":
+          $ref: "#/components/responses/NotFound"
+        "500":
+          $ref: "#/components/responses/InternalError"
+        "502":
+          $ref: "#/components/responses/UpstreamError"
+
+  /workflowruns/{namespaceName}/{runName}/logs:
+    get:
+      tags: [WorkflowRuns]
+      operationId: getWorkflowRunLogs
+      summary: Get workflow run logs
+      parameters:
+        - $ref: "#/components/parameters/NamespaceName"
+        - $ref: "#/components/parameters/RunName"
+        - $ref: "#/components/parameters/TaskName"
+        - $ref: "#/components/parameters/StreamId"
+        - $ref: "#/components/parameters/ContainerName"
+        - $ref: "#/components/parameters/SinceSeconds"
+        - $ref: "#/components/parameters/SinceTime"
+        - $ref: "#/components/parameters/TailLines"
+        - $ref: "#/components/parameters/Cursor"
+        - $ref: "#/components/parameters/Limit"
+        - name: follow
+          in: query
+          required: false
+          description: Request live-follow mode when the adapter supports it.
+          schema:
+            type: boolean
+            default: false
+      responses:
+        "200":
+          description: Normalized log entries.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/LogResponse"
+        "400":
+          $ref: "#/components/responses/BadRequest"
+        "403":
+          $ref: "#/components/responses/Forbidden"
+        "404":
+          $ref: "#/components/responses/NotFound"
+        "500":
+          $ref: "#/components/responses/InternalError"
+        "502":
+          $ref: "#/components/responses/UpstreamError"
+
+  /workflowruns/{namespaceName}/{runName}/events:
+    get:
+      tags: [WorkflowRuns]
+      operationId: getWorkflowRunEvents
+      summary: Get workflow run events
+      parameters:
+        - $ref: "#/components/parameters/NamespaceName"
+        - $ref: "#/components/parameters/RunName"
+        - $ref: "#/components/parameters/TaskName"
+        - $ref: "#/components/parameters/SinceTime"
+        - $ref: "#/components/parameters/Cursor"
+        - $ref: "#/components/parameters/Limit"
+      responses:
+        "200":
+          description: Normalized timeline events.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/EventResponse"
+        "400":
+          $ref: "#/components/responses/BadRequest"
+        "403":
+          $ref: "#/components/responses/Forbidden"
+        "404":
+          $ref: "#/components/responses/NotFound"
+        "500":
+          $ref: "#/components/responses/InternalError"
+        "502":
+          $ref: "#/components/responses/UpstreamError"
+
+  /workflowruns/{namespaceName}/{runName}/annotations:
+    get:
+      tags: [WorkflowRuns]
+      operationId: getWorkflowRunAnnotations
+      summary: Get workflow run annotations
+      parameters:
+        - $ref: "#/components/parameters/NamespaceName"
+        - $ref: "#/components/parameters/RunName"
+        - $ref: "#/components/parameters/TaskName"
+        - name: severity
+          in: query
+          required: false
+          schema:
+            $ref: "#/components/schemas/Severity"
+        - $ref: "#/components/parameters/Cursor"
+        - $ref: "#/components/parameters/Limit"
+      responses:
+        "200":
+          description: Normalized annotations.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/AnnotationResponse"
+        "404":
+          $ref: "#/components/responses/NotFound"
+        "501":
+          $ref: "#/components/responses/NotImplemented"
+        "502":
+          $ref: "#/components/responses/UpstreamError"
+
+  /workflowruns/{namespaceName}/{runName}/artifacts:
+    get:
+      tags: [WorkflowRuns]
+      operationId: listWorkflowRunArtifacts
+      summary: List workflow run artifacts
+      parameters:
+        - $ref: "#/components/parameters/NamespaceName"
+        - $ref: "#/components/parameters/RunName"
+        - $ref: "#/components/parameters/TaskName"
+      responses:
+        "200":
+          description: Artifact list.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ArtifactListResponse"
+        "404":
+          $ref: "#/components/responses/NotFound"
+        "501":
+          $ref: "#/components/responses/NotImplemented"
+        "502":
+          $ref: "#/components/responses/UpstreamError"
+
+  /workflowruns/{namespaceName}/{runName}/artifacts/{artifactId}:
+    get:
+      tags: [WorkflowRuns]
+      operationId: getWorkflowRunArtifact
+      summary: Get artifact metadata and download URL
+      parameters:
+        - $ref: "#/components/parameters/NamespaceName"
+        - $ref: "#/components/parameters/RunName"
+        - name: artifactId
+          in: path
+          required: true
+          schema:
+            type: string
+      responses:
+        "200":
+          description: Artifact metadata.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Artifact"
+        "404":
+          $ref: "#/components/responses/NotFound"
+        "501":
+          $ref: "#/components/responses/NotImplemented"
+        "502":
+          $ref: "#/components/responses/UpstreamError"
+
+  /workflowruns/{namespaceName}/{runName}/external-link:
+    get:
+      tags: [WorkflowRuns]
+      operationId: getWorkflowRunExternalLink
+      summary: Get upstream CI run link
+      parameters:
+        - $ref: "#/components/parameters/NamespaceName"
+        - $ref: "#/components/parameters/RunName"
+      responses:
+        "200":
+          description: External run link.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ExternalLinkResponse"
+        "404":
+          $ref: "#/components/responses/NotFound"
+        "500":
+          $ref: "#/components/responses/InternalError"
+
+  /workflowruns/{namespaceName}/{runName}:cancel:
+    post:
+      tags: [WorkflowRuns]
+      operationId: cancelWorkflowRun
+      summary: Cancel workflow run
+      parameters:
+        - $ref: "#/components/parameters/NamespaceName"
+        - $ref: "#/components/parameters/RunName"
+      requestBody:
+        required: false
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/CancelRunRequest"
+      responses:
+        "202":
+          description: Cancellation accepted.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/RunActionResponse"
+        "404":
+          $ref: "#/components/responses/NotFound"
+        "409":
+          $ref: "#/components/responses/Conflict"
+        "501":
+          $ref: "#/components/responses/NotImplemented"
+        "502":
+          $ref: "#/components/responses/UpstreamError"
+
+  /workflowruns/{namespaceName}/{runName}:rerun:
+    post:
+      tags: [WorkflowRuns]
+      operationId: rerunWorkflowRun
+      summary: Rerun workflow run
+      parameters:
+        - $ref: "#/components/parameters/NamespaceName"
+        - $ref: "#/components/parameters/RunName"
+      requestBody:
+        required: false
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/RerunRequest"
+      responses:
+        "202":
+          description: Rerun accepted.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/RunActionResponse"
+        "404":
+          $ref: "#/components/responses/NotFound"
+        "409":
+          $ref: "#/components/responses/Conflict"
+        "501":
+          $ref: "#/components/responses/NotImplemented"
+        "502":
+          $ref: "#/components/responses/UpstreamError"
+
+  /source/branches:
+    get:
+      tags: [Source]
+      operationId: listSourceBranches
+      summary: List repository branches
+      parameters:
+        - $ref: "#/components/parameters/RepositoryUrl"
+        - $ref: "#/components/parameters/Cursor"
+        - $ref: "#/components/parameters/Limit"
+      responses:
+        "200":
+          description: Branch list.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/BranchListResponse"
+        "501":
+          $ref: "#/components/responses/NotImplemented"
+        "502":
+          $ref: "#/components/responses/UpstreamError"
+
+  /source/commits:
+    get:
+      tags: [Source]
+      operationId: listSourceCommits
+      summary: List repository commits
+      parameters:
+        - $ref: "#/components/parameters/RepositoryUrl"
+        - name: branch
+          in: query
+          required: false
+          schema:
+            type: string
+        - $ref: "#/components/parameters/Cursor"
+        - $ref: "#/components/parameters/Limit"
+      responses:
+        "200":
+          description: Commit list.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/CommitListResponse"
+        "501":
+          $ref: "#/components/responses/NotImplemented"
+        "502":
+          $ref: "#/components/responses/UpstreamError"
+
+  /source/pullrequests:
+    get:
+      tags: [Source]
+      operationId: listSourcePullRequests
+      summary: List repository pull requests
+      parameters:
+        - $ref: "#/components/parameters/RepositoryUrl"
+        - name: state
+          in: query
+          required: false
+          schema:
+            type: string
+            enum: [open, closed, all]
+            default: open
+        - $ref: "#/components/parameters/Cursor"
+        - $ref: "#/components/parameters/Limit"
+      responses:
+        "200":
+          description: Pull request list.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/PullRequestListResponse"
+        "501":
+          $ref: "#/components/responses/NotImplemented"
+        "502":
+          $ref: "#/components/responses/UpstreamError"
+
+  /webhooks/{webhookType}:
+    post:
+      tags: [Webhooks]
+      operationId: ingestWebhook
+      summary: Ingest CI module webhook
+      security: []
+      parameters:
+        - name: webhookType
+          in: path
+          required: true
+          description: Adapter-defined webhook type, such as workflow-run, check-run, jenkins-build, or azure-service-hook.
+          schema:
+            type: string
+        - name: X-OpenChoreo-Webhook-Secret-Ref
+          in: header
+          required: false
+          schema:
+            type: string
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              additionalProperties: true
+      responses:
+        "202":
+          description: Webhook accepted.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/WebhookIngestResponse"
+        "400":
+          $ref: "#/components/responses/BadRequest"
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+        "422":
+          $ref: "#/components/responses/UnprocessableContent"
+        "500":
+          $ref: "#/components/responses/InternalError"
+
+components:
+  securitySchemes:
+    bearerAuth:
+      type: http
+      scheme: bearer
+      bearerFormat: JWT
+
+  parameters:
+    NamespaceName:
+      name: namespaceName
+      in: path
+      required: true
+      schema:
+        type: string
+        minLength: 1
+    RunName:
+      name: runName
+      in: path
+      required: true
+      schema:
+        type: string
+        minLength: 1
+    TaskName:
+      name: taskName
+      in: query
+      required: false
+      description: Logical task, job, stage, or step name.
+      schema:
+        type: string
+    StreamId:
+      name: streamId
+      in: query
+      required: false
+      description: Log stream ID returned by the log-stream discovery API.
+      schema:
+        type: string
+    ContainerName:
+      name: containerName
+      in: query
+      required: false
+      description: Container name for Kubernetes-native CI engines.
+      schema:
+        type: string
+    SinceSeconds:
+      name: sinceSeconds
+      in: query
+      required: false
+      schema:
+        type: integer
+        format: int64
+        minimum: 0
+    SinceTime:
+      name: sinceTime
+      in: query
+      required: false
+      schema:
+        type: string
+        format: date-time
+    TailLines:
+      name: tailLines
+      in: query
+      required: false
+      schema:
+        type: integer
+        minimum: 0
+    Cursor:
+      name: cursor
+      in: query
+      required: false
+      schema:
+        type: string
+    Limit:
+      name: limit
+      in: query
+      required: false
+      schema:
+        type: integer
+        minimum: 1
+        maximum: 1000
+        default: 100
+    RepositoryUrl:
+      name: repositoryUrl
+      in: query
+      required: true
+      schema:
+        type: string
+        minLength: 1
+
+  responses:
+    BadRequest:
+      description: Bad request.
+      content:
+        application/json:
+          schema:
+            $ref: "#/components/schemas/ErrorResponse"
+    Unauthorized:
+      description: Unauthorized.
+      content:
+        application/json:
+          schema:
+            $ref: "#/components/schemas/ErrorResponse"
+    Forbidden:
+      description: Forbidden.
+      content:
+        application/json:
+          schema:
+            $ref: "#/components/schemas/ErrorResponse"
+    NotFound:
+      description: Resource not found.
+      content:
+        application/json:
+          schema:
+            $ref: "#/components/schemas/ErrorResponse"
+    Conflict:
+      description: Request conflicts with current run state.
+      content:
+        application/json:
+          schema:
+            $ref: "#/components/schemas/ErrorResponse"
+    UnprocessableContent:
+      description: Webhook payload is valid JSON but cannot be processed.
+      content:
+        application/json:
+          schema:
+            $ref: "#/components/schemas/ErrorResponse"
+    InternalError:
+      description: Internal adapter error.
+      content:
+        application/json:
+          schema:
+            $ref: "#/components/schemas/ErrorResponse"
+    UpstreamError:
+      description: CI provider or workflow-plane backend returned an error.
+      content:
+        application/json:
+          schema:
+            $ref: "#/components/schemas/ErrorResponse"
+    Unavailable:
+      description: Adapter is unavailable.
+      content:
+        application/json:
+          schema:
+            $ref: "#/components/schemas/ErrorResponse"
+    NotImplemented:
+      description: Adapter does not implement this optional feature.
+      content:
+        application/json:
+          schema:
+            $ref: "#/components/schemas/ErrorResponse"
+
+  schemas:
+    HealthResponse:
+      type: object
+      required: [status]
+      properties:
+        status:
+          type: string
+          enum: [ok, degraded]
+        message:
+          type: string
+        checkedAt:
+          type: string
+          format: date-time
+
+    AdapterCapabilities:
+      type: object
+      required: [adapter, class, features]
+      properties:
+        adapter:
+          type: string
+          example: argo-ci-adapter
+        class:
+          type: string
+          example: argo
+        version:
+          type: string
+        engine:
+          type: string
+          example: Argo Workflows
+        features:
+          type: object
+          required:
+            - status
+            - tasks
+            - logs
+            - events
+            - externalLinks
+          properties:
+            status:
+              type: boolean
+            tasks:
+              type: boolean
+            logs:
+              type: boolean
+            events:
+              type: boolean
+            annotations:
+              type: boolean
+            artifacts:
+              type: boolean
+            externalLinks:
+              type: boolean
+            cancel:
+              type: boolean
+            rerun:
+              type: boolean
+            webhooks:
+              type: boolean
+            source:
+              type: boolean
+        logModes:
+          type: array
+          items:
+            type: string
+            enum: [snapshot, paginated, tail, sse, websocket]
+        supportedActions:
+          type: array
+          items:
+            type: string
+            enum: [cancel, rerun-all, rerun-failed, rerun-task]
+        metadata:
+          type: object
+          additionalProperties: true
+
+    WorkflowRunStatusResponse:
+      type: object
+      required: [namespaceName, runName, status, hasLiveObservability, tasks]
+      properties:
+        namespaceName:
+          type: string
+        runName:
+          type: string
+        class:
+          type: string
+        status:
+          $ref: "#/components/schemas/RunStatus"
+        nativeStatus:
+          type: string
+        nativeConclusion:
+          type: string
+        message:
+          type: string
+        startedAt:
+          type: string
+          format: date-time
+        finishedAt:
+          type: string
+          format: date-time
+        queuedAt:
+          type: string
+          format: date-time
+        updatedAt:
+          type: string
+          format: date-time
+        hasLiveObservability:
+          type: boolean
+        externalRun:
+          $ref: "#/components/schemas/ExternalRunRef"
+        tasks:
+          type: array
+          items:
+            $ref: "#/components/schemas/TaskStatus"
+        metadata:
+          type: object
+          additionalProperties: true
+
+    TaskListResponse:
+      type: object
+      required: [items]
+      properties:
+        items:
+          type: array
+          items:
+            $ref: "#/components/schemas/TaskStatus"
+        metadata:
+          type: object
+          additionalProperties: true
+
+    TaskStatus:
+      type: object
+      required: [id, name, status]
+      properties:
+        id:
+          type: string
+          description: Stable adapter task ID.
+        name:
+          type: string
+        displayName:
+          type: string
+        type:
+          type: string
+          enum: [workflow, stage, job, task, step, pod, container, unknown]
+          default: task
+        parentId:
+          type: string
+        status:
+          $ref: "#/components/schemas/RunStatus"
+        nativeStatus:
+          type: string
+        nativeConclusion:
+          type: string
+        message:
+          type: string
+        attempt:
+          type: integer
+          minimum: 1
+        startedAt:
+          type: string
+          format: date-time
+        finishedAt:
+          type: string
+          format: date-time
+        durationMillis:
+          type: integer
+          format: int64
+          minimum: 0
+        externalUrl:
+          type: string
+          format: uri
+        logStreams:
+          type: array
+          items:
+            $ref: "#/components/schemas/LogStream"
+        metadata:
+          type: object
+          additionalProperties: true
+
+    LogStreamListResponse:
+      type: object
+      required: [items]
+      properties:
+        items:
+          type: array
+          items:
+            $ref: "#/components/schemas/LogStream"
+
+    LogStream:
+      type: object
+      required: [id, name]
+      properties:
+        id:
+          type: string
+        name:
+          type: string
+        taskName:
+          type: string
+        taskId:
+          type: string
+        containerName:
+          type: string
+        type:
+          type: string
+          enum: [main, init, sidecar, system, archive, console, unknown]
+          default: main
+        attempt:
+          type: integer
+          minimum: 1
+        available:
+          type: boolean
+          default: true
+        metadata:
+          type: object
+          additionalProperties: true
+
+    LogResponse:
+      type: object
+      required: [entries, complete]
+      properties:
+        stream:
+          $ref: "#/components/schemas/LogStream"
+        entries:
+          type: array
+          items:
+            $ref: "#/components/schemas/LogEntry"
+        pagination:
+          $ref: "#/components/schemas/Pagination"
+        complete:
+          type: boolean
+          description: True when the response includes all logs matching the request.
+
+    LogEntry:
+      type: object
+      required: [message]
+      properties:
+        timestamp:
+          type: string
+          format: date-time
+        message:
+          type: string
+        streamId:
+          type: string
+        taskName:
+          type: string
+        taskId:
+          type: string
+        stepName:
+          type: string
+        containerName:
+          type: string
+        level:
+          type: string
+          enum: [trace, debug, info, warn, error, fatal, unknown]
+        metadata:
+          type: object
+          additionalProperties: true
+
+    EventResponse:
+      type: object
+      required: [events]
+      properties:
+        events:
+          type: array
+          items:
+            $ref: "#/components/schemas/EventEntry"
+        pagination:
+          $ref: "#/components/schemas/Pagination"
+
+    EventEntry:
+      type: object
+      required: [timestamp, type, reason, message]
+      properties:
+        timestamp:
+          type: string
+          format: date-time
+        type:
+          type: string
+          description: Provider or Kubernetes event type.
+          example: Normal
+        severity:
+          $ref: "#/components/schemas/Severity"
+        reason:
+          type: string
+        message:
+          type: string
+        taskName:
+          type: string
+        taskId:
+          type: string
+        source:
+          type: string
+        count:
+          type: integer
+          minimum: 1
+        externalUrl:
+          type: string
+          format: uri
+        metadata:
+          type: object
+          additionalProperties: true
+
+    AnnotationResponse:
+      type: object
+      required: [annotations]
+      properties:
+        annotations:
+          type: array
+          items:
+            $ref: "#/components/schemas/Annotation"
+        pagination:
+          $ref: "#/components/schemas/Pagination"
+
+    Annotation:
+      type: object
+      required: [id, severity, message]
+      properties:
+        id:
+          type: string
+        severity:
+          $ref: "#/components/schemas/Severity"
+        title:
+          type: string
+        message:
+          type: string
+        path:
+          type: string
+        startLine:
+          type: integer
+          minimum: 1
+        endLine:
+          type: integer
+          minimum: 1
+        startColumn:
+          type: integer
+          minimum: 1
+        endColumn:
+          type: integer
+          minimum: 1
+        taskName:
+          type: string
+        externalUrl:
+          type: string
+          format: uri
+        metadata:
+          type: object
+          additionalProperties: true
+
+    ArtifactListResponse:
+      type: object
+      required: [items]
+      properties:
+        items:
+          type: array
+          items:
+            $ref: "#/components/schemas/Artifact"
+
+    Artifact:
+      type: object
+      required: [id, name]
+      properties:
+        id:
+          type: string
+        name:
+          type: string
+        taskName:
+          type: string
+        sizeBytes:
+          type: integer
+          format: int64
+          minimum: 0
+        mimeType:
+          type: string
+        createdAt:
+          type: string
+          format: date-time
+        expiresAt:
+          type: string
+          format: date-time
+        downloadUrl:
+          type: string
+          format: uri
+        metadata:
+          type: object
+          additionalProperties: true
+
+    ExternalLinkResponse:
+      type: object
+      required: [externalRun]
+      properties:
+        externalRun:
+          $ref: "#/components/schemas/ExternalRunRef"
+
+    ExternalRunRef:
+      type: object
+      required: [provider, id]
+      properties:
+        provider:
+          type: string
+          example: github-actions
+        class:
+          type: string
+          example: github-actions
+        id:
+          type: string
+          description: Upstream run/build ID.
+        runNumber:
+          type: string
+        attempt:
+          type: integer
+          minimum: 1
+        workflowName:
+          type: string
+        url:
+          type: string
+          format: uri
+        repositoryUrl:
+          type: string
+        branch:
+          type: string
+        commit:
+          type: string
+        kubernetesRef:
+          $ref: "#/components/schemas/KubernetesResourceRef"
+        metadata:
+          type: object
+          additionalProperties: true
+
+    KubernetesResourceRef:
+      type: object
+      required: [apiVersion, kind, name]
+      properties:
+        apiVersion:
+          type: string
+        kind:
+          type: string
+        namespace:
+          type: string
+        name:
+          type: string
+
+    CancelRunRequest:
+      type: object
+      properties:
+        reason:
+          type: string
+
+    RerunRequest:
+      type: object
+      properties:
+        mode:
+          type: string
+          enum: [all, failed, task]
+          default: all
+        taskName:
+          type: string
+        parameters:
+          type: object
+          additionalProperties: true
+
+    RunActionResponse:
+      type: object
+      required: [accepted, status]
+      properties:
+        accepted:
+          type: boolean
+        status:
+          $ref: "#/components/schemas/RunStatus"
+        message:
+          type: string
+        externalRun:
+          $ref: "#/components/schemas/ExternalRunRef"
+        workflowRunName:
+          type: string
+
+    BranchListResponse:
+      type: object
+      required: [items]
+      properties:
+        items:
+          type: array
+          items:
+            $ref: "#/components/schemas/Branch"
+        pagination:
+          $ref: "#/components/schemas/Pagination"
+
+    Branch:
+      type: object
+      required: [name]
+      properties:
+        name:
+          type: string
+        commit:
+          type: string
+        protected:
+          type: boolean
+        url:
+          type: string
+          format: uri
+
+    CommitListResponse:
+      type: object
+      required: [items]
+      properties:
+        items:
+          type: array
+          items:
+            $ref: "#/components/schemas/Commit"
+        pagination:
+          $ref: "#/components/schemas/Pagination"
+
+    Commit:
+      type: object
+      required: [sha]
+      properties:
+        sha:
+          type: string
+        message:
+          type: string
+        authorName:
+          type: string
+        authorEmail:
+          type: string
+        authoredAt:
+          type: string
+          format: date-time
+        url:
+          type: string
+          format: uri
+
+    PullRequestListResponse:
+      type: object
+      required: [items]
+      properties:
+        items:
+          type: array
+          items:
+            $ref: "#/components/schemas/PullRequest"
+        pagination:
+          $ref: "#/components/schemas/Pagination"
+
+    PullRequest:
+      type: object
+      required: [id, title]
+      properties:
+        id:
+          type: string
+        number:
+          type: integer
+        title:
+          type: string
+        sourceBranch:
+          type: string
+        targetBranch:
+          type: string
+        commit:
+          type: string
+        state:
+          type: string
+        url:
+          type: string
+          format: uri
+        createdAt:
+          type: string
+          format: date-time
+        updatedAt:
+          type: string
+          format: date-time
+
+    WebhookIngestResponse:
+      type: object
+      required: [accepted]
+      properties:
+        accepted:
+          type: boolean
+        message:
+          type: string
+        matchedWorkflowRuns:
+          type: array
+          items:
+            type: string
+        externalRun:
+          $ref: "#/components/schemas/ExternalRunRef"
+
+    Pagination:
+      type: object
+      properties:
+        nextCursor:
+          type: string
+        remainingCount:
+          type: integer
+          format: int64
+          minimum: 0
+
+    RunStatus:
+      type: string
+      enum: [Pending, Running, Succeeded, Failed, Cancelled, Skipped, Error, Unknown]
+
+    Severity:
+      type: string
+      enum: [debug, info, warning, error]
+
+    ErrorResponse:
+      type: object
+      required: [code, message]
+      properties:
+        code:
+          type: string
+        message:
+          type: string
+        details:
+          type: object
+          additionalProperties: true

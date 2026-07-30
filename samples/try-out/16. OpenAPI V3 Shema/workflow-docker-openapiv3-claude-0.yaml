@@ -1,0 +1,189 @@
+# This is the OpenAPI v3 Schema equivalent of:
+#   samples/workflows/ci/docker.yaml
+#
+# Key change: schema.parameters now uses openAPIV3Schema instead of simple schema syntax.
+# All template expressions (CEL), runTemplate, externalRefs, and resources remain unchanged.
+
+apiVersion: openchoreo.dev/v1alpha1
+kind: Workflow
+metadata:
+  name: docker
+  namespace: default
+  annotations:
+    openchoreo.dev/description: "Docker build workflow for containerized applications using Dockerfile"
+    openchoreo.dev/workflow-scope: "component"
+    openchoreo.dev/component-workflow-parameters: |
+      repoUrl: parameters.repository.url
+      branch: parameters.repository.revision.branch
+      commit: parameters.repository.revision.commit
+      appPath: parameters.repository.appPath
+      secretRef: parameters.repository.secretRef
+spec:
+  buildPlaneRef:
+    kind: BuildPlane
+    name: default
+
+  # Template Variable Reference (same as original)
+  # ${metadata.workflowRunName}              - Generated name for this workflow run instance
+  # ${metadata.namespaceName}                - Organization namespace where the component resides
+  # ${metadata.namespace}                    - Full namespace path
+  # ${metadata.labels['key']}                - WorkflowRun labels
+  # ${parameters.repository.*}               - Repository parameters
+  # ${parameters.*}                          - Custom developer parameters defined in schema
+  # ${externalRefs['id'].spec.*}             - Resolved external CR spec
+
+  ttlAfterCompletion: "1d"
+
+  # Schema definition using openAPIV3Schema
+  schema:
+    openAPIV3Schema:
+      parameters:
+        type: object
+        required:
+          - repository
+        properties:
+          # Repository parameters - structured parameters for build automation
+          repository:
+            type: object
+            required:
+              - url
+            properties:
+              url:
+                type: string
+                description: "Git repository URL"
+              secretRef:
+                type: string
+                description: "Secret reference name for private repository Git credentials (optional for public repos)"
+              revision:
+                type: object
+                default: {}
+                properties:
+                  branch:
+                    type: string
+                    default: main
+                    description: "Git branch to checkout"
+                  commit:
+                    type: string
+                    description: "Git commit SHA or reference (optional, defaults to latest commit on branch)"
+              appPath:
+                type: string
+                default: "."
+                description: "Path to the application directory within the repository"
+
+          # Developer-configurable parameters - Custom parameters defined by Platform Engineers
+          docker:
+            type: object
+            default: {}
+            properties:
+              context:
+                type: string
+                default: "."
+                description: "Docker build context path relative to the repository root"
+              filePath:
+                type: string
+                default: "./Dockerfile"
+                description: "Path to the Dockerfile relative to the repository root"
+
+  # Workflow template (unchanged - no schema changes needed below this point)
+  runTemplate:
+    apiVersion: argoproj.io/v1alpha1
+    kind: Workflow
+    metadata:
+      name: ${metadata.workflowRunName}
+      namespace: openchoreo-ci-${metadata.namespaceName}
+    spec:
+      arguments:
+        parameters:
+          - name: component-name
+            value: ${metadata.labels['openchoreo.dev/component']}
+          - name: project-name
+            value: ${metadata.labels['openchoreo.dev/project']}
+          - name: namespace-name
+            value: ${metadata.namespaceName}
+          - name: git-repo
+            value: ${parameters.repository.url}
+          - name: branch
+            value: ${parameters.repository.revision.branch}
+          - name: commit
+            value: ${parameters.repository.revision.commit}
+          - name: app-path
+            value: ${parameters.repository.appPath}
+          - name: docker-context
+            value: ${parameters.docker.context}
+          - name: dockerfile-path
+            value: ${parameters.docker.filePath}
+          - name: registry-url
+            value: gcr.io/openchoreo-dev/images
+          - name: build-timeout
+            value: "30m"
+          - name: image-name
+            value: ${metadata.labels['openchoreo.dev/project']}-${metadata.labels['openchoreo.dev/component']}-image
+          - name: image-tag
+            value: v1
+          - name: git-secret
+            value: ${metadata.workflowRunName}-git-secret
+          - name: registry-push-secret
+            value: ${metadata.workflowRunName}-registry-push-secret
+      serviceAccountName: workflow-sa
+      workflowTemplateRef:
+        clusterScope: true
+        name: docker
+
+  externalRefs:
+    - id: git-secret-reference
+      apiVersion: openchoreo.dev/v1alpha1
+      kind: SecretReference
+      name: ${parameters.repository.secretRef}
+
+  resources:
+    - id: git-secret
+      includeWhen: ${has(parameters.repository.secretRef) && parameters.repository.secretRef != ""}
+      template:
+        apiVersion: external-secrets.io/v1
+        kind: ExternalSecret
+        metadata:
+          name: ${metadata.workflowRunName}-git-secret
+          namespace: ${metadata.namespace}
+        spec:
+          refreshInterval: 15s
+          secretStoreRef:
+            kind: ClusterSecretStore
+            name: default
+          target:
+            name: ${metadata.workflowRunName}-git-secret
+            creationPolicy: Owner
+            template:
+              type: ${externalRefs['git-secret-reference'].spec.template.type}
+          data: |
+            ${externalRefs['git-secret-reference'].spec.data.map(secret, {
+              "secretKey": secret.secretKey,
+              "remoteRef": {
+                "key": secret.remoteRef.key,
+                "property": has(secret.remoteRef.property) && secret.remoteRef.property != "" ? secret.remoteRef.property : oc_omit()
+              }
+            })}
+
+    - id: registry-push-secret
+      template:
+        apiVersion: external-secrets.io/v1
+        kind: ExternalSecret
+        metadata:
+          name: ${metadata.workflowRunName}-registry-push-secret
+          namespace: ${metadata.namespace}
+        spec:
+          refreshInterval: 15s
+          secretStoreRef:
+            name: default
+            kind: ClusterSecretStore
+          target:
+            name: ${metadata.workflowRunName}-registry-push-secret
+            creationPolicy: Owner
+            template:
+              type: kubernetes.io/dockerconfigjson
+              data:
+                .dockerconfigjson: "{{ .registrysecret | toString }}"
+          data:
+            - secretKey: registrysecret
+              remoteRef:
+                key: registry-push-secret
+                property: value

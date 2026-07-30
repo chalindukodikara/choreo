@@ -1,0 +1,45 @@
+# Copyright 2025 The OpenChoreo Authors
+# SPDX-License-Identifier: Apache-2.0
+#
+# Smoke-test for the openclaw-gateway ComponentType.
+# Creates a Workload + Component in the default project with autoDeploy=true
+# so the ComponentRelease / ReleaseBinding / RenderedRelease chain runs end-to-end
+# against a placeholder OpenClaw image.
+---
+apiVersion: openchoreo.dev/v1alpha1
+kind: Workload
+metadata:
+  name: openclaw
+  namespace: default
+spec:
+  owner:
+    componentName: openclaw
+    projectName: default
+  endpoints:
+    gateway:
+      type: HTTP
+      port: 18789
+      visibility: [external]
+  container:
+    image: ghcr.io/openclaw/openclaw:v0
+    env:
+      - key: NODE_ENV
+        value: production
+
+---
+apiVersion: openchoreo.dev/v1alpha1
+kind: Component
+metadata:
+  name: openclaw
+  namespace: default
+spec:
+  owner:
+    projectName: default
+  autoDeploy: true
+  componentType:
+    kind: ComponentType
+    name: deployment/openclaw-gateway
+  parameters:
+    enabledChannels:
+      - slack
+      - discord

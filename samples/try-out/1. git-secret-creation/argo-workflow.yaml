@@ -1,0 +1,81 @@
+apiVersion: argoproj.io/v1alpha1
+kind: Workflow
+metadata:
+  name: test-workflow-01
+  namespace: openchoreo-ci-default
+spec:
+  entrypoint: clone-step
+
+  # ───────── parameters you override at submit time ─────────
+  arguments:
+    parameters:
+      - { name: git-repo,  value: "https://github.com/chalindukodikara/doclet" }
+      - { name: branch,    value: main }
+      - { name: commit,    value: "" }                # empty → latest of branch
+      - { name: git-secret,value: github-credentials-source }
+
+  # ───────── shared PVC for /mnt/vol ─────────
+  volumeClaimTemplates:
+    - metadata: { name: workspace }
+      spec:
+        accessModes: ["ReadWriteOnce"]
+        resources: { requests: { storage: 1Gi } }
+
+  ttlStrategy: { secondsAfterCompletion: 3600 }
+
+  # ───────── single-step template ─────────
+  templates:
+    - name: clone-step
+      outputs:
+        parameters:
+          - name: git-revision
+            valueFrom: { path: /tmp/git-revision.txt }
+
+      container:
+        image: alpine/git:latest
+        # command is now an array; the third element is the script
+        command:
+          - sh
+          - -c
+          - |
+            set -e
+            BRANCH="{{workflow.parameters.branch}}"
+            REPO_URL="{{workflow.parameters.git-repo}}"
+            COMMIT="{{workflow.parameters.commit}}"
+            
+            TOKEN_FILE=/etc/secrets/git-secret/password
+            [ -f "$TOKEN_FILE" ] && GIT_TOKEN=$(cat "$TOKEN_FILE") || GIT_TOKEN=""
+            
+            CLONE_URL="$REPO_URL"
+            if [ -n "$GIT_TOKEN" ]; then
+              case "$REPO_URL" in
+                https://*) HOST=${REPO_URL#https://}; HOST=${HOST%%/*};;
+                git@*)     HOST=${REPO_URL#git@};     HOST=${HOST%%:*};;
+              esac
+              CLONE_URL="https://${GIT_TOKEN}@${HOST}${REPO_URL#*${HOST}}"
+            fi
+            
+            echo "🔄 Cloning $CLONE_URL"
+            mkdir -p /mnt/vol/source
+            if [ -n "$COMMIT" ]; then
+              git clone --no-checkout --depth 1 "$CLONE_URL" /mnt/vol/source
+              cd /mnt/vol/source && \
+                git fetch --depth 1 origin "$COMMIT" && \
+                git checkout "$COMMIT"
+              REV="$COMMIT"
+            else
+              git clone --single-branch --branch "$BRANCH" --depth 1 \
+                "$CLONE_URL" /mnt/vol/source
+              cd /mnt/vol/source && REV=$(git rev-parse HEAD)
+            fi
+            echo -n "${REV:0:8}" > /tmp/git-revision.txt
+
+        volumeMounts:
+          - { name: workspace, mountPath: /mnt/vol }
+          - { name: git-secret, mountPath: /etc/secrets/git-secret, readOnly: true }
+
+      volumes:
+        - name: git-secret
+          secret:
+            secretName: "{{workflow.parameters.git-secret}}"
+            optional: true

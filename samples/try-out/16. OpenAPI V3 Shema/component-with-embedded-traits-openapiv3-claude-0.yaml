@@ -1,0 +1,536 @@
+# Copyright 2025 The OpenChoreo Authors
+# SPDX-License-Identifier: Apache-2.0
+#
+# This is the OpenAPI v3 Schema equivalent of:
+#   samples/component-types/component-with-embedded-traits/component-with-embedded-traits.yaml
+#
+# Key change: schema sections now use openAPIV3Schema instead of simple schema syntax.
+# All template expressions (CEL), resources, patches, and non-schema fields remain unchanged.
+
+---
+# HorizontalPodAutoscaler Trait - openAPIV3Schema version
+apiVersion: openchoreo.dev/v1alpha1
+kind: Trait
+metadata:
+  name: horizontal-pod-autoscaler
+  namespace: default
+spec:
+  schema:
+    openAPIV3Schema:
+      parameters:
+        type: object
+        properties:
+          enabled:
+            type: boolean
+            default: false
+          minReplicas:
+            type: integer
+            default: 2
+            minimum: 1
+          maxReplicas:
+            type: integer
+            default: 10
+            minimum: 1
+          targetCPUUtilizationPercentage:
+            type: integer
+            default: 80
+            minimum: 1
+            maximum: 100
+
+      envOverrides:
+        type: object
+        properties:
+          minReplicas:
+            type: integer
+            minimum: 1
+          maxReplicas:
+            type: integer
+            minimum: 1
+
+  creates:
+    - includeWhen: ${parameters.enabled}
+      template:
+        apiVersion: autoscaling/v2
+        kind: HorizontalPodAutoscaler
+        metadata:
+          name: ${metadata.name}
+          namespace: ${metadata.namespace}
+          labels: ${metadata.labels}
+        spec:
+          scaleTargetRef:
+            apiVersion: apps/v1
+            kind: Deployment
+            name: ${metadata.name}
+          minReplicas: |
+            ${has(envOverrides.minReplicas) ? envOverrides.minReplicas : parameters.minReplicas}
+          maxReplicas: |
+            ${has(envOverrides.maxReplicas) ? envOverrides.maxReplicas : parameters.maxReplicas}
+          metrics:
+            - type: Resource
+              resource:
+                name: cpu
+                target:
+                  type: Utilization
+                  averageUtilization: ${parameters.targetCPUUtilizationPercentage}
+
+---
+# Persistent Volume Trait - openAPIV3Schema version
+apiVersion: openchoreo.dev/v1alpha1
+kind: Trait
+metadata:
+  name: persistent-volume
+  namespace: default
+spec:
+  schema:
+    openAPIV3Schema:
+      parameters:
+        type: object
+        required:
+          - volumeName
+          - mountPath
+        properties:
+          volumeName:
+            type: string
+          mountPath:
+            type: string
+          containerName:
+            type: string
+            default: main
+
+      envOverrides:
+        type: object
+        properties:
+          size:
+            type: string
+            default: "10Gi"
+          storageClass:
+            type: string
+            default: local-path
+
+  creates:
+    - template:
+        apiVersion: v1
+        kind: PersistentVolumeClaim
+        metadata:
+          name: ${metadata.name}-${trait.instanceName}
+          namespace: ${metadata.namespace}
+        spec:
+          accessModes:
+            - ReadWriteOnce
+          resources:
+            requests:
+              storage: ${envOverrides.size}
+          storageClassName: ${envOverrides.storageClass}
+
+  patches:
+    - target:
+        group: apps
+        version: v1
+        kind: Deployment
+      operations:
+        - op: add
+          path: /spec/template/spec/volumes/-
+          value:
+            name: ${parameters.volumeName}
+            persistentVolumeClaim:
+              claimName: ${metadata.name}-${trait.instanceName}
+
+    - target:
+        group: apps
+        version: v1
+        kind: Deployment
+      operations:
+        - op: add
+          path: /spec/template/spec/containers/[?(@.name=='${parameters.containerName}')]/volumeMounts/-
+          value:
+            name: ${parameters.volumeName}
+            mountPath: ${parameters.mountPath}
+
+---
+# ComponentType with embedded HPA trait - openAPIV3Schema version
+#
+# Note on custom types: The simple schema version uses `types:` for reusable type definitions
+# (ResourceRequirements, ResourceQuantity). OpenAPI v3 Schema (K8s CRD subset) does not support
+# $ref, so these must be inlined. See research document for mitigation options.
+apiVersion: openchoreo.dev/v1alpha1
+kind: ComponentType
+metadata:
+  name: service-with-autoscaling
+  namespace: default
+spec:
+  workloadType: deployment
+
+  allowedWorkflows:
+    - kind: Workflow
+      name: google-cloud-buildpacks
+    - kind: Workflow
+      name: ballerina-buildpack
+    - kind: Workflow
+      name: docker
+
+  allowedTraits:
+    - name: api-configuration
+    - name: observability-alert-rule
+    - name: persistent-volume
+
+  validations:
+    - rule: "${size(workload.endpoints) > 0}"
+      message: "Service components must have at least one endpoint. Use 'deployment/worker' for components without endpoints."
+
+  schema:
+    openAPIV3Schema:
+      # Note: No 'types' section. The ResourceRequirements/ResourceQuantity types from the
+      # simple schema are inlined directly into the envOverrides.resources definition below.
+
+      parameters:
+        type: object
+        properties:
+          # Autoscaling parameters - wired to embedded HPA trait
+          # Developers can configure min/max replicas; CPU threshold is locked by PE
+          autoscaling:
+            type: object
+            default: {}
+            properties:
+              enabled:
+                type: boolean
+                default: false
+              minReplicas:
+                type: integer
+                default: 2
+                minimum: 1
+              maxReplicas:
+                type: integer
+                default: 10
+                minimum: 1
+
+      envOverrides:
+        type: object
+        default: {}
+        properties:
+          replicas:
+            type: integer
+            default: 1
+          resources:
+            type: object
+            default: {}
+            description: "Container resource requirements"
+            properties:
+              requests:
+                type: object
+                default: {}
+                properties:
+                  cpu:
+                    type: string
+                    default: "100m"
+                  memory:
+                    type: string
+                    default: "256Mi"
+              limits:
+                type: object
+                default: {}
+                properties:
+                  cpu:
+                    type: string
+                    default: "100m"
+                  memory:
+                    type: string
+                    default: "256Mi"
+          imagePullPolicy:
+            type: string
+            default: IfNotPresent
+          # Environment-specific autoscaling overrides
+          # Note: targetCPUUtilizationPercentage is locked by PE at 75%, not overridable
+          autoscaling:
+            type: object
+            default: {}
+            properties:
+              minReplicas:
+                type: integer
+                minimum: 1
+              maxReplicas:
+                type: integer
+                minimum: 1
+
+  # Embedded traits - automatically applied to all Components of this type
+  traits:
+    - name: horizontal-pod-autoscaler
+      instanceName: autoscaler
+      parameters:
+        enabled: ${parameters.autoscaling.enabled}
+        minReplicas: ${parameters.autoscaling.minReplicas}
+        maxReplicas: ${parameters.autoscaling.maxReplicas}
+        targetCPUUtilizationPercentage: 75
+      envOverrides:
+        minReplicas: ${envOverrides.autoscaling.minReplicas}
+        maxReplicas: ${envOverrides.autoscaling.maxReplicas}
+
+  resources:
+    - id: deployment
+      template:
+        apiVersion: apps/v1
+        kind: Deployment
+        metadata:
+          name: ${metadata.name}
+          namespace: ${metadata.namespace}
+          labels: ${metadata.labels}
+        spec:
+          replicas: ${envOverrides.replicas}
+          selector:
+            matchLabels: ${metadata.podSelectors}
+          template:
+            metadata:
+              labels: ${metadata.podSelectors}
+            spec:
+              containers:
+                - name: main
+                  image: ${workload.container.image}
+                  imagePullPolicy: ${envOverrides.imagePullPolicy}
+                  command: |
+                    ${has(workload.container.command) ? workload.container.command : oc_omit()}
+                  args: |
+                    ${has(workload.container.args) ? workload.container.args : oc_omit()}
+                  resources:
+                    requests:
+                      cpu: ${envOverrides.resources.requests.cpu}
+                      memory: ${envOverrides.resources.requests.memory}
+                    limits:
+                      cpu: ${envOverrides.resources.limits.cpu}
+                      memory: ${envOverrides.resources.limits.memory}
+                  envFrom: ${configurations.toContainerEnvFrom()}
+                  volumeMounts: ${configurations.toContainerVolumeMounts()}
+              volumes: ${configurations.toVolumes()}
+
+    - id: service
+      includeWhen: ${size(workload.endpoints) > 0}
+      template:
+        apiVersion: v1
+        kind: Service
+        metadata:
+          name: ${metadata.componentName}
+          namespace: ${metadata.namespace}
+          labels: ${metadata.labels}
+        spec:
+          type: ClusterIP
+          selector: ${metadata.podSelectors}
+          ports: ${workload.toServicePorts()}
+    - id: httproute-external
+      forEach: '${workload.endpoints.transformList(name, ep, ("external" in ep.visibility && ep.type in ["HTTP", "REST", "GraphQL", "Websocket"]) ? [name] : []).flatten()}'
+      var: endpoint
+      template:
+        apiVersion: gateway.networking.k8s.io/v1
+        kind: HTTPRoute
+        metadata:
+          name: ${oc_generate_name(metadata.componentName, endpoint)}
+          namespace: ${metadata.namespace}
+          labels: '${oc_merge(metadata.labels, {"openchoreo.dev/endpoint-name": endpoint, "openchoreo.dev/endpoint-visibility": "external"})}'
+        spec:
+          parentRefs:
+            - name: ${gateway.ingress.external.name}
+              namespace: ${gateway.ingress.external.namespace}
+          hostnames: |
+            ${[gateway.ingress.external.?http, gateway.ingress.external.?https]
+              .filter(g, g.hasValue()).map(g, g.value().host).distinct()
+              .map(h, metadata.environmentName + "-" + metadata.componentNamespace + "." + h)}
+          rules:
+          - matches:
+            - path:
+                type: PathPrefix
+                value: /${metadata.componentName}-${endpoint}
+            filters:
+              - type: URLRewrite
+                urlRewrite:
+                  path:
+                    type: ReplacePrefixMatch
+                    replacePrefixMatch: '${workload.endpoints[endpoint].?basePath.orValue("") != "" ? workload.endpoints[endpoint].?basePath.orValue("") : "/"}'
+            backendRefs:
+            - name: ${metadata.componentName}
+              port: ${workload.endpoints[endpoint].port}
+    - id: httproute-internal
+      forEach: '${workload.endpoints.transformList(name, ep, ("internal" in ep.visibility && ep.type in ["HTTP", "REST", "GraphQL", "Websocket"]) ? [name] : []).flatten()}'
+      var: endpoint
+      template:
+        apiVersion: gateway.networking.k8s.io/v1
+        kind: HTTPRoute
+        metadata:
+          name: '${oc_generate_name(metadata.componentName, endpoint, "internal")}'
+          namespace: ${metadata.namespace}
+          labels: '${oc_merge(metadata.labels, {"openchoreo.dev/endpoint-name": endpoint, "openchoreo.dev/endpoint-visibility": "internal"})}'
+        spec:
+          parentRefs:
+            - name: ${gateway.ingress.internal.name}
+              namespace: ${gateway.ingress.internal.namespace}
+          hostnames: |
+            ${[gateway.ingress.internal.?http, gateway.ingress.internal.?https]
+              .filter(g, g.hasValue()).map(g, g.value().host).distinct()
+              .map(h, metadata.environmentName + "-" + metadata.componentNamespace + "." + h)}
+          rules:
+          - matches:
+            - path:
+                type: PathPrefix
+                value: /${metadata.componentName}-${endpoint}
+            filters:
+              - type: URLRewrite
+                urlRewrite:
+                  path:
+                    type: ReplacePrefixMatch
+                    replacePrefixMatch: '${workload.endpoints[endpoint].?basePath.orValue("") != "" ? workload.endpoints[endpoint].?basePath.orValue("") : "/"}'
+            backendRefs:
+            - name: ${metadata.componentName}
+              port: ${workload.endpoints[endpoint].port}
+    - id: env-config
+      forEach: ${configurations.toConfigEnvsByContainer()}
+      var: envConfig
+      template:
+        apiVersion: v1
+        kind: ConfigMap
+        metadata:
+          name: ${envConfig.resourceName}
+          namespace: ${metadata.namespace}
+        data: |
+          ${envConfig.envs.transformMapEntry(index, env, {env.name: env.value})}
+    - id: file-config
+      forEach: ${configurations.toConfigFileList()}
+      var: config
+      template:
+        apiVersion: v1
+        kind: ConfigMap
+        metadata:
+          name: ${config.resourceName}
+          namespace: ${metadata.namespace}
+        data:
+          ${config.name}: |
+            ${config.value}
+    - id: secret-env-external
+      forEach: ${configurations.toSecretEnvsByContainer()}
+      var: secretEnv
+      template:
+        apiVersion: external-secrets.io/v1
+        kind: ExternalSecret
+        metadata:
+          name: ${secretEnv.resourceName}
+          namespace: ${metadata.namespace}
+        spec:
+          refreshInterval: 15s
+          secretStoreRef:
+            name: ${dataplane.secretStore}
+            kind: ClusterSecretStore
+          target:
+            name: ${secretEnv.resourceName}
+            creationPolicy: Owner
+          data: |
+            ${secretEnv.envs.map(secret, {
+              "secretKey": secret.name,
+              "remoteRef": {
+                "key": secret.remoteRef.key,
+                "property": has(secret.remoteRef.property) ? secret.remoteRef.property : oc_omit()
+              }
+            })}
+    - id: secret-file-external
+      forEach: ${configurations.toSecretFileList()}
+      var: file
+      template:
+        apiVersion: external-secrets.io/v1
+        kind: ExternalSecret
+        metadata:
+          name: ${file.resourceName}
+          namespace: ${metadata.namespace}
+        spec:
+          refreshInterval: 15s
+          secretStoreRef:
+            name: ${dataplane.secretStore}
+            kind: ClusterSecretStore
+          target:
+            name: ${file.resourceName}
+            creationPolicy: Owner
+          data:
+            - secretKey: ${file.name}
+              remoteRef:
+                key: ${file.remoteRef.key}
+                property: |
+                  ${has(file.remoteRef.property) ? file.remoteRef.property : oc_omit()}
+
+---
+# Component using the ComponentType with embedded traits (unchanged - no schema here)
+apiVersion: openchoreo.dev/v1alpha1
+kind: Component
+metadata:
+  name: demo-app-with-embedded-traits
+  namespace: default
+spec:
+  owner:
+    projectName: default
+
+  componentType:
+    kind: ComponentType
+    name: deployment/service-with-autoscaling
+  autoDeploy: true
+
+  parameters:
+    autoscaling:
+      enabled: true
+      minReplicas: 2
+      maxReplicas: 10
+
+  traits:
+    - name: persistent-volume
+      instanceName: data-storage
+      parameters:
+        volumeName: app-data
+        mountPath: /var/data
+        containerName: main
+
+---
+# Workload (unchanged - no schema here)
+apiVersion: openchoreo.dev/v1alpha1
+kind: Workload
+metadata:
+  name: demo-app-with-embedded-traits-workload
+  namespace: default
+spec:
+  owner:
+    projectName: default
+    componentName: demo-app-with-embedded-traits
+
+  endpoints:
+    http:
+      type: HTTP
+      port: 9090
+      visibility: [external]
+
+  container:
+    image: "ghcr.io/openchoreo/samples/greeter-service:latest"
+    args:
+      - --port
+      - "9090"
+
+---
+# ReleaseBinding (unchanged - no schema here)
+apiVersion: openchoreo.dev/v1alpha1
+kind: ReleaseBinding
+metadata:
+  name: demo-app-with-embedded-traits-development
+  namespace: default
+spec:
+  owner:
+    projectName: default
+    componentName: demo-app-with-embedded-traits
+
+  environment: development
+
+  componentTypeEnvOverrides:
+    replicas: 3
+    resources:
+      requests:
+        cpu: "50m"
+        memory: "128Mi"
+      limits:
+        cpu: "200m"
+        memory: "256Mi"
+    autoscaling:
+      minReplicas: 1
+      maxReplicas: 5
+
+  traitEnvironmentConfigs:
+    data-storage:
+      size: "10Mi"
+      storageClass: "local-path"

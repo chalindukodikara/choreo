@@ -1,0 +1,32 @@
+apiVersion: argoproj.io/v1alpha1
+kind: Workflow
+metadata:
+  name: argo-workflow
+  namespace: openchoreo-ci-${metadata.namespaceName}
+spec:
+  arguments:
+    parameters:
+      - name: component-name
+        value: aaaa
+      - name: project-name
+        value: bbb
+      - name: git-repo
+        value: ccc
+      - name: branch
+        value: main
+      - name: commit
+        value: klj12131
+      - name: app-path
+        value: go-greeter
+      - name: image-name
+        value: greeter-service-image
+      - name: image-tag
+        value: v1
+      - name: git-secret
+        value: test-run-git-secret
+      - name: registry-push-secret
+        value: registry-push-secret
+  serviceAccountName: workflow-sa
+  workflowTemplateRef:
+    clusterScope: true
+    name: google-cloud-buildpacks

@@ -1,0 +1,22 @@
+apiVersion: batch/v1
+kind: CronJob
+metadata:
+  name: hello-cron
+  namespace: default
+spec:
+  # ── When to run ──────────────────────────────────────────────────────────────
+  schedule: "*/1 * * * *"      # every minute
+  # ── History limits (optional, helps the garbage-collector) ───────────────────
+  successfulJobsHistoryLimit: 3
+  failedJobsHistoryLimit: 1
+  # ── Job template ─────────────────────────────────────────────────────────────
+  jobTemplate:
+    spec:
+      ttlSecondsAfterFinished: 60   # 1 minute TTL
+      template:
+        spec:
+          restartPolicy: Never
+          containers:
+            - name: hello
+              image: busybox:latest
+              command: ["echo", "Hello from a CronJob!"]

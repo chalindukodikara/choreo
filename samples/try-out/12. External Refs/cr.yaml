@@ -1,0 +1,33 @@
+# externalRefs is a list of external Kubernetes object references that the controller resolves (read-only) and injects into the CEL context under the given id
+externalRefs:
+  - id: git-secret-reference # lowercase alphanumeric + hyphens, must start with a letter.  Max 63: standard DNS label limit. No underscores/dots: keeps it simple and Kubernetes-idiomatic.
+    apiVersion: openchoreo.dev/v1alpha1
+    kind: SecretReference
+    name: ${parameters.repository.secretRef}
+resources:
+  # Template: creates an ExternalSecret using the resolved SecretReference data
+  - id: git-secret
+    template:
+      apiVersion: external-secrets.io/v1
+      kind: ExternalSecret
+      metadata:
+        name: ${metadata.workflowRunName}-git-secret
+        namespace: ${metadata.namespace}
+      spec:
+        refreshInterval: 15s
+        secretStoreRef:
+          kind: ClusterSecretStore
+          name: openbao
+        target:
+          name: ${metadata.workflowRunName}-git-secret
+          creationPolicy: Owner
+          template:
+            type: ${externalRefs['git-secret-reference'].spec.template.type}
+        data: |
+          ${externalRefs['git-secret-reference'].spec.data.map(secret, {
+            "secretKey": secret.secretKey,
+            "remoteRef": {
+              "key": secret.remoteRef.key,
+              "property": has(secret.remoteRef.property) && secret.remoteRef.property != "" ? secret.remoteRef.property : oc_omit()
+            }
+          })}

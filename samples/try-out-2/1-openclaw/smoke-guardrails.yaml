@@ -1,0 +1,73 @@
+# Copyright 2025 The OpenChoreo Authors
+# SPDX-License-Identifier: Apache-2.0
+#
+# Guardrail negative-test harness for ComponentType/openclaw-gateway.
+# Each case is a Workload + Component pair that should fail validation or
+# rendering. Used to confirm the CT's governance actually fires.
+#
+# Apply with:
+#   kubectl apply -f smoke-guardrails.yaml
+# Then inspect each Component's status conditions.
+---
+# Case A: enabledChannels is empty — violates parameters schema (minItems: 1)
+# AND the validation "openclaw-gateway requires at least one messaging channel".
+apiVersion: openchoreo.dev/v1alpha1
+kind: Workload
+metadata:
+  name: bad-no-channels
+  namespace: default
+spec:
+  owner:
+    componentName: bad-no-channels
+    projectName: default
+  endpoints:
+    gateway:
+      type: HTTP
+      port: 18789
+      visibility: [external]
+  container:
+    image: ghcr.io/openclaw/openclaw:v0
+---
+apiVersion: openchoreo.dev/v1alpha1
+kind: Component
+metadata:
+  name: bad-no-channels
+  namespace: default
+spec:
+  owner:
+    projectName: default
+  autoDeploy: true
+  componentType:
+    kind: ComponentType
+    name: deployment/openclaw-gateway
+  parameters:
+    enabledChannels: []
+---
+# Case B: workload has no endpoints — violates the validation
+# "openclaw-gateway must declare an endpoint".
+apiVersion: openchoreo.dev/v1alpha1
+kind: Workload
+metadata:
+  name: bad-no-endpoint
+  namespace: default
+spec:
+  owner:
+    componentName: bad-no-endpoint
+    projectName: default
+  container:
+    image: ghcr.io/openclaw/openclaw:v0
+---
+apiVersion: openchoreo.dev/v1alpha1
+kind: Component
+metadata:
+  name: bad-no-endpoint
+  namespace: default
+spec:
+  owner:
+    projectName: default
+  autoDeploy: true
+  componentType:
+    kind: ComponentType
+    name: deployment/openclaw-gateway
+  parameters:
+    enabledChannels: [slack]

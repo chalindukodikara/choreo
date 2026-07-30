@@ -1,0 +1,1405 @@
+The Doc that I am going to attach
+
+# Build Mirror and Layer Caching with Zot
+
+Deploy a cluster-internal [Zot](https://zotregistry.dev/) OCI registry in the workflow plane and use it for two independent cache paths:
+
+- **Mirror cache**: pull-through cache for upstream builder, run, lifecycle, and Dockerfile base images. Implemented as a mounted `registries.conf` ConfigMap — Podman handles mirroring transparently for all image pulls, including those delegated by Pack CLI via `--docker-host inherit`.
+- **Layer cache**: registry-backed build layer cache for Podman Dockerfile builds and Pack CLI buildpack builds.
+
+Component authors control caching with:
+
+```yaml
+parameters:
+  cache:
+    mirror:
+      enabled: true
+    layers:
+      mode: reuse # disabled | reuse | rebuild
+```
+
+Layer modes:
+
+| Mode | Read layer cache | Write layer cache | Use case |
+|---|---:|---:|---|
+| `disabled` | no | no | Fully uncached build |
+| `reuse` | yes | yes | Normal fast build |
+| `rebuild` | no | yes | Clean build that refreshes the cache for later builds |
+
+Mirror caching and layer caching are intentionally independent. You can disable the mirror while still using layer cache, or disable layer cache while still pulling upstream images through Zot.
+
+### How mirroring works
+
+```
+ClusterWorkflow creates registries-conf ConfigMap per WorkflowRun (when mirror.enabled)
+  → ClusterWorkflowTemplate mounts it at /etc/containers/registries.conf.d/mirrors.conf
+    → Podman reads it on every pull
+      → Pack CLI uses --docker-host inherit → Podman → mirror applies
+      → podman build → mirror applies to FROM images
+```
+
+No explicit ref rewriting needed. Builder, run, lifecycle, and Dockerfile base images all route through the mirror automatically. Podman tries the mirror first and falls back to upstream if the mirror is unavailable. When the ConfigMap is absent (mirror disabled), Podman pulls directly from upstream — no script changes needed.
+
+---
+
+## Prerequisites
+
+- A running OpenChoreo cluster with the workflow plane installed
+- `kubectl` configured to access the cluster
+- [yq v4](https://github.com/mikefarah/yq) for the patch commands
+
+---
+
+## Step 1: Deploy Zot
+
+Create the Zot configuration, deployment, service, and PVC in the `openchoreo-workflow-plane` namespace.
+
+### 1.1 Create the namespace
+
+```bash
+kubectl create namespace openchoreo-workflow-plane --dry-run=client -o yaml | kubectl apply -f -
+```
+
+### 1.2 Deploy the registry
+
+Use the full Zot image, not `zot-minimal`, because mirroring uses Zot's `sync` extension.
+
+```bash
+kubectl apply -f - <<'EOF'
+---
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: build-cache-config
+  namespace: openchoreo-workflow-plane
+data:
+  config.json: |
+    {
+      "distSpecVersion": "1.1.0",
+      "storage": {
+        "rootDirectory": "/var/lib/registry",
+        "gc": true,
+        "gcDelay": "2h",
+        "gcInterval": "6h",
+        "retention": {
+          "policies": [
+            {
+              "repositories": ["build-cache/containerfile/**"],
+              "keepTags": {
+                "pushedWithin": "168h",
+                "pulledWithin": "168h",
+                "mostRecentlyPushedCount": 3,
+                "mostRecentlyPulledCount": 3
+              }
+            },
+            {
+              "repositories": ["build-cache/cnb/**"],
+              "keepTags": {
+                "pushedWithin": "168h",
+                "pulledWithin": "168h",
+                "mostRecentlyPushedCount": 3,
+                "mostRecentlyPulledCount": 3
+              }
+            },
+            {
+              "repositories": ["build-tmp/**"],
+              "keepTags": {
+                "pushedWithin": "1h",
+                "pulledWithin": "1h"
+              }
+            },
+            {
+              "repositories": ["mirror/**"],
+              "keepTags": {
+                "pushedWithin": "336h",
+                "pulledWithin": "336h",
+                "mostRecentlyPulledCount": 2
+              }
+            },
+            {
+              "repositories": ["**"],
+              "keepTags": {
+                "pushedWithin": "72h",
+                "pulledWithin": "72h",
+                "mostRecentlyPulledCount": 1
+              }
+            }
+          ]
+        }
+      },
+      "http": {
+        "address": "0.0.0.0",
+        "port": "5100",
+        "compat": ["docker2s2"]
+      },
+      "log": {
+        "level": "warn"
+      },
+      "extensions": {
+        "sync": {
+          "enable": true,
+          "registries": [
+            {
+              "urls": ["https://docker.io"],
+              "onDemand": true,
+              "tlsVerify": true,
+              "maxRetries": 3,
+              "retryDelay": "30s",
+              "content": [
+                {
+                  "prefix": "/**",
+                  "destination": "/mirror/docker.io",
+                  "stripPrefix": false
+                }
+              ]
+            },
+            {
+              "urls": ["https://gcr.io"],
+              "onDemand": true,
+              "tlsVerify": true,
+              "maxRetries": 3,
+              "retryDelay": "30s",
+              "content": [
+                {
+                  "prefix": "/**",
+                  "destination": "/mirror/gcr.io",
+                  "stripPrefix": false
+                }
+              ]
+            },
+            {
+              "urls": ["https://ghcr.io"],
+              "onDemand": true,
+              "tlsVerify": true,
+              "maxRetries": 3,
+              "retryDelay": "30s",
+              "content": [
+                {
+                  "prefix": "/**",
+                  "destination": "/mirror/ghcr.io",
+                  "stripPrefix": false
+                }
+              ]
+            },
+            {
+              "urls": ["https://quay.io"],
+              "onDemand": true,
+              "tlsVerify": true,
+              "maxRetries": 3,
+              "retryDelay": "30s",
+              "content": [
+                {
+                  "prefix": "/**",
+                  "destination": "/mirror/quay.io",
+                  "stripPrefix": false
+                }
+              ]
+            }
+          ]
+        }
+      }
+    }
+---
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: build-cache-data
+  namespace: openchoreo-workflow-plane
+spec:
+  accessModes:
+    - ReadWriteOnce
+  resources:
+    requests:
+      storage: 10Gi
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: build-cache
+  namespace: openchoreo-workflow-plane
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: build-cache
+  template:
+    metadata:
+      labels:
+        app: build-cache
+    spec:
+      containers:
+        - name: zot
+          image: ghcr.io/project-zot/zot-linux-amd64:v2.1.3
+          imagePullPolicy: IfNotPresent
+          args: ["serve", "/etc/zot/config.json"]
+          ports:
+            - containerPort: 5100
+              name: http
+          volumeMounts:
+            - name: data
+              mountPath: /var/lib/registry
+            - name: config
+              mountPath: /etc/zot/config.json
+              subPath: config.json
+              readOnly: true
+          resources:
+            requests:
+              cpu: 50m
+              memory: 64Mi
+            limits:
+              cpu: 500m
+              memory: 512Mi
+          readinessProbe:
+            httpGet:
+              path: /v2/
+              port: http
+            initialDelaySeconds: 5
+            periodSeconds: 10
+          livenessProbe:
+            httpGet:
+              path: /v2/
+              port: http
+            initialDelaySeconds: 10
+            periodSeconds: 30
+      volumes:
+        - name: config
+          configMap:
+            name: build-cache-config
+        - name: data
+          persistentVolumeClaim:
+            claimName: build-cache-data
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: build-cache
+  namespace: openchoreo-workflow-plane
+spec:
+  type: ClusterIP
+  ports:
+    - port: 5100
+      targetPort: http
+      protocol: TCP
+      name: http
+  selector:
+    app: build-cache
+EOF
+```
+
+The `docker2s2` compatibility mode is required when Pack CLI uses `--publish`. Pack can export Docker Manifest v2 Schema 2, and Zot rejects that media type unless this compatibility mode is enabled.
+
+For Docker Hub, use only `onDemand: true`; do not configure polled mirroring because Docker Hub is rate-limited and does not support catalog listing.
+
+### 1.3 Verify Zot
+
+```bash
+kubectl -n openchoreo-workflow-plane rollout status deployment/build-cache
+
+kubectl -n openchoreo-workflow-plane port-forward svc/build-cache 5100:5100 &
+sleep 2
+curl -v http://localhost:5100/v2/
+kill %1
+```
+
+You should see `HTTP/1.1 200 OK` and `Docker-Distribution-Api-Version: registry/2.0`.
+
+---
+
+## Step 2: Patch Workflow Templates
+
+Patch the in-cluster `ClusterWorkflowTemplate` resources so they:
+
+1. Accept `build-cache` and `cache-layers-mode` input parameters for layer caching
+2. Mount an optional `registries-conf` ConfigMap for transparent mirroring
+
+Mirroring is handled entirely by the mounted `registries.conf` — build scripts only contain layer cache logic.
+
+### 2.1 Apply the updated ClusterWorkflowTemplates
+
+Run the following `kubectl apply` commands from the OpenChoreo repository root.
+
+#### 2.1.1 containerfile-build
+
+```bash
+kubectl apply -f - <<'EOF'
+apiVersion: argoproj.io/v1alpha1
+kind: ClusterWorkflowTemplate
+metadata:
+  name: containerfile-build
+spec:
+  templates:
+    - name: build-image
+      podSpecPatch: '{"hostUsers": false}'
+      inputs:
+        parameters:
+          - name: git-revision
+          - name: build-env
+          - name: build-args
+          - name: build-cache
+            default: "build-cache.openchoreo-workflow-plane.svc.cluster.local:5100"
+          - name: cache-layers-mode
+            default: "reuse"
+      volumes:
+        - name: storage
+          emptyDir:
+            sizeLimit: 10Gi
+        - name: registries-conf
+          configMap:
+            name: "{{workflow.parameters.workflowrun-name}}-registries-conf"
+            optional: true
+      container:
+        image: ghcr.io/openchoreo/podman-runner:v1.2
+        command:
+          - sh
+          - -c
+        args:
+          - |-
+            set -e
+
+            WORKDIR="/mnt/vol/source"
+            IMAGE="{{workflow.parameters.image-name}}:{{workflow.parameters.image-tag}}-{{inputs.parameters.git-revision}}"
+            DOCKER_CONTEXT="{{workflow.parameters.docker-context}}"
+            DOCKERFILE_PATH="{{workflow.parameters.dockerfile-path}}"
+            BUILD_ENV_JSON='{{inputs.parameters.build-env}}'
+            BUILD_ARGS_JSON='{{inputs.parameters.build-args}}'
+            CACHE_REGISTRY="{{inputs.parameters.build-cache}}"
+            CACHE_LAYERS_MODE="{{inputs.parameters.cache-layers-mode}}"
+
+            echo ">> Image: $IMAGE"
+            echo ">> Dockerfile: $DOCKERFILE_PATH"
+            echo ">> Docker context: $DOCKER_CONTEXT"
+
+            if [ ! -f "$WORKDIR/$DOCKERFILE_PATH" ]; then
+              echo ">> Error: Dockerfile not found at: '$DOCKERFILE_PATH'"
+              echo ">> Hint: Verify that the Dockerfile path is correct and relative to the repository root."
+              echo ">> Repository contents:"
+              ls -la "$WORKDIR/"
+              exit 1
+            fi
+
+            if [ ! -d "$WORKDIR/$DOCKER_CONTEXT" ]; then
+              echo ">> Error: Docker build context directory not found: '$DOCKER_CONTEXT'"
+              echo ">> Hint: Verify that the Docker build context points to a valid directory relative to the repository root."
+              echo ">> Repository contents:"
+              ls -la "$WORKDIR/"
+              exit 1
+            fi
+
+            case "$CACHE_LAYERS_MODE" in
+              disabled|reuse|rebuild) ;;
+              *)
+                echo ">> Error: invalid cache layers mode '$CACHE_LAYERS_MODE' (expected disabled, reuse, or rebuild)"
+                exit 1
+                ;;
+            esac
+
+            mkdir -p /storage/run /storage/graph
+            cat > /etc/containers/storage.conf <<STEOF
+            [storage]
+            driver = "overlay"
+            runroot = "/storage/run"
+            graphroot = "/storage/graph"
+            [storage.options.overlay]
+            STEOF
+
+            ENV_ARGS=""
+            if [ -n "$BUILD_ENV_JSON" ] && [ "$BUILD_ENV_JSON" != "[]" ]; then
+              ENV_ARGS=$(echo "$BUILD_ENV_JSON" | jq -r '.[] | "--env \(.name)=\(.value)"' | tr '\n' ' ')
+            fi
+
+            BUILD_ARG_ARGS=""
+            if [ -n "$BUILD_ARGS_JSON" ] && [ "$BUILD_ARGS_JSON" != "[]" ]; then
+              BUILD_ARG_ARGS=$(echo "$BUILD_ARGS_JSON" | jq -r '.[] | "--build-arg \(.name)=\(.value)"' | tr '\n' ' ')
+            fi
+
+            CACHE_AVAILABLE="false"
+            CACHE_ARGS=""
+            if [ -n "$CACHE_REGISTRY" ] && [ "$CACHE_REGISTRY" != "none" ]; then
+              if curl -sf --connect-timeout 3 "http://${CACHE_REGISTRY}/v2/" >/dev/null 2>&1; then
+                CACHE_AVAILABLE="true"
+                mkdir -p /etc/containers/registries.conf.d
+                cat > /etc/containers/registries.conf.d/build-cache.conf <<REGEOF
+            [[registry]]
+            location = "${CACHE_REGISTRY}"
+            insecure = true
+            REGEOF
+              fi
+            fi
+
+            if [ -f /etc/containers/registries.conf.d/mirrors.conf ]; then
+              echo ">> Upstream image mirror: mounted via registries.conf"
+            fi
+
+            if [ "$CACHE_AVAILABLE" = "true" ] && [ "$CACHE_LAYERS_MODE" != "disabled" ]; then
+              CACHE_REF="${CACHE_REGISTRY}/build-cache/containerfile/{{workflow.parameters.image-name}}"
+              case "$CACHE_LAYERS_MODE" in
+                reuse)
+                  CACHE_ARGS="--layers --cache-from=${CACHE_REF} --cache-to=${CACHE_REF} --cache-ttl=168h"
+                  echo ">> Layer cache: reuse ${CACHE_REF}"
+                  ;;
+                rebuild)
+                  CACHE_ARGS="--layers --cache-to=${CACHE_REF} --cache-ttl=168h"
+                  echo ">> Layer cache: rebuild ${CACHE_REF}"
+                  ;;
+              esac
+            elif [ "$CACHE_LAYERS_MODE" != "disabled" ]; then
+              echo ">> Cache registry not reachable, building without layer cache"
+            else
+              echo ">> Layer cache disabled"
+            fi
+
+            echo ">> Building image"
+            podman build -t $IMAGE -f $WORKDIR/$DOCKERFILE_PATH $ENV_ARGS $BUILD_ARG_ARGS $CACHE_ARGS $WORKDIR/$DOCKER_CONTEXT
+            echo ">> Image built successfully"
+            podman save -o /mnt/vol/app-image.tar $IMAGE
+        securityContext:
+          privileged: true
+        volumeMounts:
+          - mountPath: /mnt/vol
+            name: workspace
+          - mountPath: /storage
+            name: storage
+          - mountPath: /etc/containers/registries.conf.d/mirrors.conf
+            subPath: mirrors.conf
+            name: registries-conf
+            readOnly: true
+EOF
+```
+
+#### 2.1.2 Buildpacks templates
+
+The three Buildpacks templates share the same cache flow. Each mounts the `registries-conf` ConfigMap and uses upstream image refs directly — Podman routes pulls through the mirror transparently when the ConfigMap is present.
+
+```bash
+kubectl apply -f - <<'EOF'
+apiVersion: argoproj.io/v1alpha1
+kind: ClusterWorkflowTemplate
+metadata:
+  name: paketo-buildpacks-build
+spec:
+  templates:
+    - name: build-image
+      podSpecPatch: '{"hostUsers": false}'
+      inputs:
+        parameters:
+          - name: git-revision
+          - name: build-cache
+            default: "build-cache.openchoreo-workflow-plane.svc.cluster.local:5100"
+          - name: cache-layers-mode
+            default: "reuse"
+      volumes:
+        - name: storage
+          emptyDir:
+            sizeLimit: 10Gi
+        - name: registries-conf
+          configMap:
+            name: "{{workflow.parameters.workflowrun-name}}-registries-conf"
+            optional: true
+      container:
+        image: ghcr.io/openchoreo/podman-runner:v1.2
+        command: [sh, -c]
+        args:
+          - |-
+            set -e
+
+            WORKDIR=/mnt/vol/source
+            GIT_REVISION="{{inputs.parameters.git-revision}}"
+            IMAGE="{{workflow.parameters.image-name}}:{{workflow.parameters.image-tag}}-${GIT_REVISION}"
+            APP_PATH="{{workflow.parameters.app-path}}"
+            BUILD_ENV_JSON='{{workflow.parameters.build-env}}'
+            CACHE_REGISTRY="{{inputs.parameters.build-cache}}"
+            CACHE_LAYERS_MODE="{{inputs.parameters.cache-layers-mode}}"
+
+            case "$CACHE_LAYERS_MODE" in disabled|reuse|rebuild) ;; *) echo ">> Error: invalid cache layers mode '$CACHE_LAYERS_MODE'"; exit 1 ;; esac
+
+            if [ ! -d "$WORKDIR/$APP_PATH" ]; then
+              echo ">> Error: The specified application path '$APP_PATH' does not exist in the repository"
+              ls -la "$WORKDIR/"
+              exit 1
+            fi
+
+            mkdir -p /storage/run /storage/graph
+            cat > /etc/containers/storage.conf <<STEOF
+            [storage]
+            driver = "overlay"
+            runroot = "/storage/run"
+            graphroot = "/storage/graph"
+            [storage.options.overlay]
+            STEOF
+
+            cat > /etc/containers/containers.conf <<CEOF
+            [containers]
+            netns="host"
+            userns="host"
+            ipcns="host"
+            utsns="host"
+            cgroupns="host"
+            cgroups="disabled"
+            log_driver = "k8s-file"
+            [engine]
+            cgroup_manager = "cgroupfs"
+            events_logger="file"
+            runtime="crun"
+            CEOF
+
+            mkdir -p /run/podman
+            podman system service --time=0 unix:///run/podman/podman.sock &
+            until podman info --format '{{.Host.RemoteSocket.Exists}}' 2>/dev/null | grep -q true; do sleep 1; done
+            export DOCKER_HOST=unix:///run/podman/podman.sock
+
+            BUILDER="docker.io/paketobuildpacks/builder-jammy-full:0.3.603"
+            RUN_IMG="docker.io/paketobuildpacks/run-jammy-full:0.1.130"
+
+            ENV_ARGS=""
+            if [ -n "$BUILD_ENV_JSON" ] && [ "$BUILD_ENV_JSON" != "[]" ]; then
+              ENV_ARGS=$(echo "$BUILD_ENV_JSON" | jq -r '.[] | "--env \(.name)=\(.value)"' | tr '\n' ' ')
+            fi
+
+            CACHE_AVAILABLE="false"
+            PACK_REGISTRY_ARGS=""
+            if [ -n "$CACHE_REGISTRY" ] && [ "$CACHE_REGISTRY" != "none" ]; then
+              if curl -sf --max-time 3 -o /dev/null "http://${CACHE_REGISTRY}/v2/" 2>/dev/null; then
+                CACHE_AVAILABLE="true"
+                PACK_REGISTRY_ARGS="--insecure-registry ${CACHE_REGISTRY}"
+                mkdir -p /etc/containers/registries.conf.d
+                cat > /etc/containers/registries.conf.d/build-cache.conf <<REGEOF
+            [[registry]]
+            location = "${CACHE_REGISTRY}"
+            insecure = true
+            REGEOF
+              fi
+            fi
+
+            if [ -f /etc/containers/registries.conf.d/mirrors.conf ]; then
+              echo ">> Upstream image mirror: mounted via registries.conf"
+            fi
+
+            if [ "$CACHE_AVAILABLE" = "true" ] && [ "$CACHE_LAYERS_MODE" != "disabled" ]; then
+              CACHE_IMAGE="${CACHE_REGISTRY}/build-cache/cnb/{{workflow.parameters.image-name}}:cnb-cache"
+              PUBLISH_REF="${CACHE_REGISTRY}/build-tmp/cnb/{{workflow.parameters.image-name}}:{{workflow.parameters.image-tag}}-${GIT_REVISION}"
+              CLEAR_CACHE_ARG=""
+              if [ "$CACHE_LAYERS_MODE" = "rebuild" ]; then CLEAR_CACHE_ARG="--clear-cache"; fi
+
+              pack build "$PUBLISH_REF" \
+                --builder "$BUILDER" \
+                --run-image "$RUN_IMG" \
+                --path "$WORKDIR/$APP_PATH" \
+                --pull-policy always \
+                --publish \
+                $PACK_REGISTRY_ARGS \
+                --cache-image "$CACHE_IMAGE" \
+                $CLEAR_CACHE_ARG \
+                $ENV_ARGS
+
+              podman pull --tls-verify=false "$PUBLISH_REF"
+              podman tag "$PUBLISH_REF" "$IMAGE"
+              podman save -o /mnt/vol/app-image.tar "$IMAGE"
+              exit 0
+            fi
+
+            pack build "$IMAGE" \
+              --builder "$BUILDER" \
+              --run-image "$RUN_IMG" \
+              --docker-host inherit \
+              --path "$WORKDIR/$APP_PATH" \
+              --pull-policy always \
+              $PACK_REGISTRY_ARGS \
+              $ENV_ARGS
+
+            until podman image exists "$IMAGE" 2>/dev/null; do sleep 1; done
+            podman save -o /mnt/vol/app-image.tar "$IMAGE"
+        securityContext:
+          privileged: true
+        volumeMounts:
+          - mountPath: /mnt/vol
+            name: workspace
+          - mountPath: /storage
+            name: storage
+          - mountPath: /etc/containers/registries.conf.d/mirrors.conf
+            subPath: mirrors.conf
+            name: registries-conf
+            readOnly: true
+EOF
+```
+
+```bash
+kubectl apply -f - <<'EOF'
+apiVersion: argoproj.io/v1alpha1
+kind: ClusterWorkflowTemplate
+metadata:
+  name: gcp-buildpacks-build
+spec:
+  templates:
+    - name: build-image
+      podSpecPatch: '{"hostUsers": false}'
+      inputs:
+        parameters:
+          - name: git-revision
+          - name: build-cache
+            default: "build-cache.openchoreo-workflow-plane.svc.cluster.local:5100"
+          - name: cache-layers-mode
+            default: "reuse"
+      volumes:
+        - name: storage
+          emptyDir:
+            sizeLimit: 10Gi
+        - name: registries-conf
+          configMap:
+            name: "{{workflow.parameters.workflowrun-name}}-registries-conf"
+            optional: true
+      container:
+        image: ghcr.io/openchoreo/podman-runner:v1.2
+        command: [sh, -c]
+        args:
+          - |-
+            set -e
+
+            WORKDIR=/mnt/vol/source
+            GIT_REVISION="{{inputs.parameters.git-revision}}"
+            IMAGE="{{workflow.parameters.image-name}}:{{workflow.parameters.image-tag}}-${GIT_REVISION}"
+            APP_PATH="{{workflow.parameters.app-path}}"
+            BUILD_ENV_JSON='{{workflow.parameters.build-env}}'
+            CACHE_REGISTRY="{{inputs.parameters.build-cache}}"
+            CACHE_LAYERS_MODE="{{inputs.parameters.cache-layers-mode}}"
+
+            case "$CACHE_LAYERS_MODE" in disabled|reuse|rebuild) ;; *) echo ">> Error: invalid cache layers mode '$CACHE_LAYERS_MODE'"; exit 1 ;; esac
+
+            if [ ! -d "$WORKDIR/$APP_PATH" ]; then
+              echo ">> Error: The specified application path '$APP_PATH' does not exist in the repository"
+              ls -la "$WORKDIR/"
+              exit 1
+            fi
+
+            mkdir -p /storage/run /storage/graph
+            cat > /etc/containers/storage.conf <<STEOF
+            [storage]
+            driver = "overlay"
+            runroot = "/storage/run"
+            graphroot = "/storage/graph"
+            [storage.options.overlay]
+            STEOF
+
+            cat > /etc/containers/containers.conf <<CEOF
+            [containers]
+            netns="host"
+            userns="host"
+            ipcns="host"
+            utsns="host"
+            cgroupns="host"
+            cgroups="disabled"
+            log_driver = "k8s-file"
+            [engine]
+            cgroup_manager = "cgroupfs"
+            events_logger="file"
+            runtime="crun"
+            CEOF
+
+            mkdir -p /run/podman
+            podman system service --time=0 unix:///run/podman/podman.sock &
+            until podman info --format '{{.Host.RemoteSocket.Exists}}' 2>/dev/null | grep -q true; do sleep 1; done
+            export DOCKER_HOST=unix:///run/podman/podman.sock
+
+            BUILDER="gcr.io/buildpacks/builder@sha256:5977b4bd47d3e9ff729eefe9eb99d321d4bba7aa3b14986323133f40b622aef1"
+            RUN_IMG="gcr.io/buildpacks/google-22/run@sha256:a8ccb6641b4d98b0adf6397f954e7194611d1ae61310f0561f1c00fdf7f9ba96"
+
+            ENV_ARGS=""
+            if [ -n "$BUILD_ENV_JSON" ] && [ "$BUILD_ENV_JSON" != "[]" ]; then
+              ENV_ARGS=$(echo "$BUILD_ENV_JSON" | jq -r '.[] | "--env \(.name)=\(.value)"' | tr '\n' ' ')
+            fi
+
+            CACHE_AVAILABLE="false"
+            PACK_REGISTRY_ARGS=""
+            if [ -n "$CACHE_REGISTRY" ] && [ "$CACHE_REGISTRY" != "none" ]; then
+              if curl -sf --max-time 3 -o /dev/null "http://${CACHE_REGISTRY}/v2/" 2>/dev/null; then
+                CACHE_AVAILABLE="true"
+                PACK_REGISTRY_ARGS="--insecure-registry ${CACHE_REGISTRY}"
+                mkdir -p /etc/containers/registries.conf.d
+                cat > /etc/containers/registries.conf.d/build-cache.conf <<REGEOF
+            [[registry]]
+            location = "${CACHE_REGISTRY}"
+            insecure = true
+            REGEOF
+              fi
+            fi
+
+            if [ -f /etc/containers/registries.conf.d/mirrors.conf ]; then
+              echo ">> Upstream image mirror: mounted via registries.conf"
+            fi
+
+            if [ "$CACHE_AVAILABLE" = "true" ] && [ "$CACHE_LAYERS_MODE" != "disabled" ]; then
+              CACHE_IMAGE="${CACHE_REGISTRY}/build-cache/cnb/{{workflow.parameters.image-name}}:cnb-cache"
+              PUBLISH_REF="${CACHE_REGISTRY}/build-tmp/cnb/{{workflow.parameters.image-name}}:{{workflow.parameters.image-tag}}-${GIT_REVISION}"
+              CLEAR_CACHE_ARG=""
+              if [ "$CACHE_LAYERS_MODE" = "rebuild" ]; then CLEAR_CACHE_ARG="--clear-cache"; fi
+
+              pack build "$PUBLISH_REF" \
+                --builder "$BUILDER" \
+                --run-image "$RUN_IMG" \
+                --path "$WORKDIR/$APP_PATH" \
+                --pull-policy always \
+                --publish \
+                $PACK_REGISTRY_ARGS \
+                --cache-image "$CACHE_IMAGE" \
+                $CLEAR_CACHE_ARG \
+                $ENV_ARGS
+
+              podman pull --tls-verify=false "$PUBLISH_REF"
+              podman tag "$PUBLISH_REF" "$IMAGE"
+              podman save -o /mnt/vol/app-image.tar "$IMAGE"
+              exit 0
+            fi
+
+            pack build "$IMAGE" \
+              --builder "$BUILDER" \
+              --run-image "$RUN_IMG" \
+              --docker-host inherit \
+              --path "$WORKDIR/$APP_PATH" \
+              --pull-policy always \
+              $PACK_REGISTRY_ARGS \
+              $ENV_ARGS
+
+            until podman image exists "$IMAGE" 2>/dev/null; do sleep 1; done
+            podman save -o /mnt/vol/app-image.tar "$IMAGE"
+        securityContext:
+          privileged: true
+        volumeMounts:
+          - mountPath: /mnt/vol
+            name: workspace
+          - mountPath: /storage
+            name: storage
+          - mountPath: /etc/containers/registries.conf.d/mirrors.conf
+            subPath: mirrors.conf
+            name: registries-conf
+            readOnly: true
+EOF
+```
+
+```bash
+kubectl apply -f - <<'EOF'
+apiVersion: argoproj.io/v1alpha1
+kind: ClusterWorkflowTemplate
+metadata:
+  name: ballerina-buildpack-build
+spec:
+  templates:
+    - name: build-image
+      podSpecPatch: '{"hostUsers": false}'
+      inputs:
+        parameters:
+          - name: git-revision
+          - name: build-env
+          - name: build-cache
+            default: "build-cache.openchoreo-workflow-plane.svc.cluster.local:5100"
+          - name: cache-layers-mode
+            default: "reuse"
+      volumes:
+        - name: storage
+          emptyDir:
+            sizeLimit: 10Gi
+        - name: app-dir
+          emptyDir: {}
+        - name: registries-conf
+          configMap:
+            name: "{{workflow.parameters.workflowrun-name}}-registries-conf"
+            optional: true
+      container:
+        image: ghcr.io/openchoreo/podman-runner:v1.2
+        command: [sh, -c]
+        args:
+          - |-
+            set -e
+
+            WORKDIR=/mnt/vol/source
+            GIT_REVISION="{{inputs.parameters.git-revision}}"
+            IMAGE="{{workflow.parameters.image-name}}:{{workflow.parameters.image-tag}}-${GIT_REVISION}"
+            APP_PATH="{{workflow.parameters.app-path}}"
+            BUILD_ENV_JSON='{{inputs.parameters.build-env}}'
+            CACHE_REGISTRY="{{inputs.parameters.build-cache}}"
+            CACHE_LAYERS_MODE="{{inputs.parameters.cache-layers-mode}}"
+
+            case "$CACHE_LAYERS_MODE" in disabled|reuse|rebuild) ;; *) echo ">> Error: invalid cache layers mode '$CACHE_LAYERS_MODE'"; exit 1 ;; esac
+
+            if [ ! -d "$WORKDIR/$APP_PATH" ]; then
+              echo ">> Error: The specified application path '$APP_PATH' does not exist in the repository"
+              ls -la "$WORKDIR/"
+              exit 1
+            fi
+
+            mkdir -p /storage/run /storage/graph
+            cat > /etc/containers/storage.conf <<STEOF
+            [storage]
+            driver = "overlay"
+            runroot = "/storage/run"
+            graphroot = "/storage/graph"
+            [storage.options.overlay]
+            STEOF
+
+            cat > /etc/containers/containers.conf <<CEOF
+            [containers]
+            netns="host"
+            userns="host"
+            ipcns="host"
+            utsns="host"
+            cgroupns="host"
+            cgroups="disabled"
+            log_driver = "k8s-file"
+            [engine]
+            cgroup_manager = "cgroupfs"
+            events_logger="file"
+            runtime="crun"
+            CEOF
+
+            mkdir -p /run/podman
+            podman system service --time=0 unix:///run/podman/podman.sock &
+            until podman info --format '{{.Host.RemoteSocket.Exists}}' 2>/dev/null | grep -q true; do sleep 1; done
+            export DOCKER_HOST=unix:///run/podman/podman.sock
+
+            BUILDER="ghcr.io/openchoreo/buildpack/ballerina:18"
+            RUN_IMAGE="ghcr.io/openchoreo/buildpack/ballerina:18-run"
+
+            ENV_ARGS=""
+            if [ -n "$BUILD_ENV_JSON" ] && [ "$BUILD_ENV_JSON" != "[]" ]; then
+              ENV_ARGS=$(echo "$BUILD_ENV_JSON" | jq -r '.[] | "--env \(.name)=\(.value)"' | tr '\n' ' ')
+            fi
+
+            CACHE_AVAILABLE="false"
+            PACK_REGISTRY_ARGS=""
+            if [ -n "$CACHE_REGISTRY" ] && [ "$CACHE_REGISTRY" != "none" ]; then
+              if curl -sf --max-time 3 -o /dev/null "http://${CACHE_REGISTRY}/v2/" 2>/dev/null; then
+                CACHE_AVAILABLE="true"
+                PACK_REGISTRY_ARGS="--insecure-registry ${CACHE_REGISTRY}"
+                mkdir -p /etc/containers/registries.conf.d
+                cat > /etc/containers/registries.conf.d/build-cache.conf <<REGEOF
+            [[registry]]
+            location = "${CACHE_REGISTRY}"
+            insecure = true
+            REGEOF
+              fi
+            fi
+
+            if [ -f /etc/containers/registries.conf.d/mirrors.conf ]; then
+              echo ">> Upstream image mirror: mounted via registries.conf"
+            fi
+
+            if [ "$CACHE_AVAILABLE" = "true" ] && [ "$CACHE_LAYERS_MODE" != "disabled" ]; then
+              CACHE_IMAGE="${CACHE_REGISTRY}/build-cache/cnb/{{workflow.parameters.image-name}}:cnb-cache"
+              PUBLISH_REF="${CACHE_REGISTRY}/build-tmp/cnb/{{workflow.parameters.image-name}}:{{workflow.parameters.image-tag}}-${GIT_REVISION}"
+              CLEAR_CACHE_ARG=""
+              if [ "$CACHE_LAYERS_MODE" = "rebuild" ]; then CLEAR_CACHE_ARG="--clear-cache"; fi
+
+              pack build "$PUBLISH_REF" \
+                --builder "$BUILDER" \
+                --run-image "$RUN_IMAGE" \
+                --path "$WORKDIR/$APP_PATH" \
+                --volume "/mnt/vol:/app/generated-artifacts:rw" \
+                --pull-policy always \
+                --publish \
+                $PACK_REGISTRY_ARGS \
+                --cache-image "$CACHE_IMAGE" \
+                $CLEAR_CACHE_ARG \
+                $ENV_ARGS
+
+              podman pull --tls-verify=false "$PUBLISH_REF"
+              podman tag "$PUBLISH_REF" "$IMAGE"
+              podman save -o /mnt/vol/app-image.tar "$IMAGE"
+              exit 0
+            fi
+
+            pack build "$IMAGE" \
+              --builder "$BUILDER" \
+              --run-image "$RUN_IMAGE" \
+              --docker-host inherit \
+              --path "$WORKDIR/$APP_PATH" \
+              --volume "/mnt/vol:/app/generated-artifacts:rw" \
+              --pull-policy always \
+              $PACK_REGISTRY_ARGS \
+              $ENV_ARGS
+
+            until podman image exists "$IMAGE" 2>/dev/null; do sleep 1; done
+            podman save -o /mnt/vol/app-image.tar "$IMAGE"
+        securityContext:
+          privileged: true
+        volumeMounts:
+          - mountPath: /mnt/vol
+            name: workspace
+          - mountPath: /storage
+            name: storage
+          - mountPath: /app
+            name: app-dir
+          - mountPath: /etc/containers/registries.conf.d/mirrors.conf
+            subPath: mirrors.conf
+            name: registries-conf
+            readOnly: true
+EOF
+```
+
+### 2.2 What changed from the original templates
+
+Each template adds:
+
+1. **`registries-conf` volume** — an optional ConfigMap named after the WorkflowRun. When present, Podman transparently routes upstream image pulls through Zot. When absent, Podman pulls directly from upstream.
+
+```yaml
+volumes:
+  - name: registries-conf
+    configMap:
+      name: "{{workflow.parameters.workflowrun-name}}-registries-conf"
+      optional: true
+```
+
+2. **`registries-conf` volumeMount** — mounted as a drop-in file in `registries.conf.d/` to avoid replacing any existing container configuration.
+
+```yaml
+volumeMounts:
+  - mountPath: /etc/containers/registries.conf.d/mirrors.conf
+    subPath: mirrors.conf
+    name: registries-conf
+    readOnly: true
+```
+
+3. **Simplified input parameters** — only `build-cache` and `cache-layers-mode`. The `cache-mirror-enabled` parameter is no longer needed because mirroring is controlled by ConfigMap presence.
+
+4. **No mirror ref rewriting in scripts** — builder, run, and lifecycle image refs stay as upstream refs. No `pack config lifecycle-image` workaround needed. Build scripts only handle layer cache logic.
+
+### 2.3 Cache probe and layer cache
+
+The cache probe checks if Zot is reachable and registers it as an insecure registry for layer cache push/pull:
+
+```bash
+CACHE_AVAILABLE="false"
+if [ -n "$CACHE_REGISTRY" ] && [ "$CACHE_REGISTRY" != "none" ]; then
+  if curl -sf --max-time 3 -o /dev/null "http://${CACHE_REGISTRY}/v2/" 2>/dev/null; then
+    CACHE_AVAILABLE="true"
+    mkdir -p /etc/containers/registries.conf.d
+    cat > /etc/containers/registries.conf.d/build-cache.conf <<REGEOF
+[[registry]]
+location = "${CACHE_REGISTRY}"
+insecure = true
+REGEOF
+  fi
+fi
+```
+
+Podman layer cache uses `--cache-from`/`--cache-to` with a `--cache-ttl`:
+
+```bash
+CACHE_ARGS="--layers --cache-from=${CACHE_REF} --cache-to=${CACHE_REF} --cache-ttl=168h"
+```
+
+Pack CLI layer cache uses `--publish` with `--cache-image`. When using `--publish`, the built image is pushed to Zot, then pulled back and saved as a tar:
+
+```bash
+pack build "$PUBLISH_REF" \
+  --builder "$BUILDER" \
+  --run-image "$RUN_IMG" \
+  --publish \
+  --cache-image "$CACHE_IMAGE" \
+  ...
+
+podman pull --tls-verify=false "$PUBLISH_REF"
+podman tag "$PUBLISH_REF" "$IMAGE"
+podman save -o /mnt/vol/app-image.tar "$IMAGE"
+```
+
+### 2.4 Template patch checklist
+
+For each `ClusterWorkflowTemplate`:
+
+1. Add input parameters:
+
+```yaml
+- name: build-cache
+  default: "build-cache.openchoreo-workflow-plane.svc.cluster.local:5100"
+- name: cache-layers-mode
+  default: "reuse"
+```
+
+2. Add `registries-conf` volume (`optional: true`) and volumeMount (`registries.conf.d/mirrors.conf`).
+3. Remove mirror ref rewriting from the build script.
+4. Keep the cache probe, insecure registry entry, and layer cache logic.
+
+---
+
+## Step 3: Patch CI Workflows
+
+Patch the existing `ClusterWorkflow` resources so developers configure cache with a structured parameter. The workflow creates a `registries-conf` ConfigMap per WorkflowRun when mirroring is enabled, and passes layer cache parameters to the build templates.
+
+### 3.1 Patch all four CI workflows
+
+```bash
+CACHE_DESC="Build cache configuration. mirror.enabled controls upstream image pull-through caching via a mounted registries.conf. layers.mode controls layer cache behavior: disabled, reuse, or rebuild."
+
+REGISTRIES_CONF='[[registry]]
+location = "build-cache.openchoreo-workflow-plane.svc.cluster.local:5100"
+insecure = true
+
+[[registry]]
+location = "docker.io"
+[[registry.mirror]]
+location = "build-cache.openchoreo-workflow-plane.svc.cluster.local:5100/mirror/docker.io"
+insecure = true
+
+[[registry]]
+location = "gcr.io"
+[[registry.mirror]]
+location = "build-cache.openchoreo-workflow-plane.svc.cluster.local:5100/mirror/gcr.io"
+insecure = true
+
+[[registry]]
+location = "ghcr.io"
+[[registry.mirror]]
+location = "build-cache.openchoreo-workflow-plane.svc.cluster.local:5100/mirror/ghcr.io"
+insecure = true
+
+[[registry]]
+location = "quay.io"
+[[registry.mirror]]
+location = "build-cache.openchoreo-workflow-plane.svc.cluster.local:5100/mirror/quay.io"
+insecure = true'
+
+for workflow in dockerfile-builder paketo-buildpacks-builder gcp-buildpacks-builder ballerina-buildpack-builder; do
+  kubectl get clusterworkflow "$workflow" -o yaml | \
+    yq '
+      del(
+        .metadata.creationTimestamp,
+        .metadata.generation,
+        .metadata.managedFields,
+        .metadata.resourceVersion,
+        .metadata.uid,
+        .status
+      ) |
+
+      .spec.parameters.openAPIV3Schema.properties.cache = {
+        "type": "object",
+        "default": {
+          "mirror": {"enabled": true},
+          "layers": {"mode": "reuse"}
+        },
+        "description": "'"$CACHE_DESC"'",
+        "properties": {
+          "mirror": {
+            "type": "object",
+            "default": {"enabled": true},
+            "properties": {
+              "enabled": {
+                "type": "boolean",
+                "default": true,
+                "description": "Pull upstream builder, run, lifecycle, and base images through the workflow-plane cache registry when available"
+              }
+            }
+          },
+          "layers": {
+            "type": "object",
+            "default": {"mode": "reuse"},
+            "properties": {
+              "mode": {
+                "type": "string",
+                "default": "reuse",
+                "enum": ["disabled", "reuse", "rebuild"],
+                "description": "Layer cache mode: disabled skips cache, reuse reads and writes cache, rebuild ignores existing cache and writes a fresh cache"
+              }
+            }
+          }
+        }
+      } |
+
+      .spec.runTemplate.spec.arguments.parameters |=
+        [.[] | select(.name != "build-cache" and .name != "cache-layers-mode")] +
+        [
+          {"name": "build-cache", "value": "build-cache.openchoreo-workflow-plane.svc.cluster.local:5100"},
+          {"name": "cache-layers-mode", "value": "${parameters.cache.layers.mode}"}
+        ] |
+
+      .spec.runTemplate.spec.templates[0].steps[1][0].arguments.parameters |=
+        [.[] | select(.name != "build-cache" and .name != "cache-layers-mode")] +
+        [
+          {"name": "build-cache", "value": "{{workflow.parameters.build-cache}}"},
+          {"name": "cache-layers-mode", "value": "{{workflow.parameters.cache-layers-mode}}"}
+        ] |
+
+      .spec.resources = (.spec.resources // []) |
+      del(.spec.resources[] | select(.id == "build-registries-conf")) |
+      .spec.resources += [
+        {
+          "id": "build-registries-conf",
+          "includeWhen": "${parameters.cache.mirror.enabled}",
+          "template": {
+            "apiVersion": "v1",
+            "kind": "ConfigMap",
+            "metadata": {
+              "name": "${metadata.workflowRunName}-registries-conf",
+              "namespace": "${metadata.namespace}"
+            },
+            "data": {
+              "mirrors.conf": ""
+            }
+          }
+        }
+      ]
+    ' | \
+    REGISTRIES_CONF="$REGISTRIES_CONF" yq '
+      (.spec.resources[] | select(.id == "build-registries-conf")).template.data."mirrors.conf" = strenv(REGISTRIES_CONF) |
+      (.spec.resources[] | select(.id == "build-registries-conf")).template.data."mirrors.conf" style="literal"
+    ' | kubectl apply -f -
+  echo "Patched $workflow"
+done
+```
+
+The `build-registries-conf` resource uses `includeWhen: ${parameters.cache.mirror.enabled}` so the ConfigMap is only created when mirroring is enabled. When it's not created, the `optional: true` volume mount in the ClusterWorkflowTemplate means the build pod starts normally — Podman just pulls from upstream.
+
+### 3.2 Verify the workflow schema
+
+```bash
+for workflow in dockerfile-builder paketo-buildpacks-builder gcp-buildpacks-builder ballerina-buildpack-builder; do
+  echo "=== $workflow ==="
+  kubectl get clusterworkflow "$workflow" -o yaml | yq '.spec.parameters.openAPIV3Schema.properties.cache'
+  echo ""
+done
+```
+
+Each workflow should show `cache.mirror.enabled` and `cache.layers.mode` with enum values:
+
+```yaml
+enum:
+  - disabled
+  - reuse
+  - rebuild
+```
+
+### 3.3 Verify the registries-conf resource
+
+```bash
+for workflow in dockerfile-builder paketo-buildpacks-builder gcp-buildpacks-builder ballerina-buildpack-builder; do
+  echo "=== $workflow ==="
+  kubectl get clusterworkflow "$workflow" -o yaml | yq '.spec.resources[] | select(.id == "build-registries-conf")'
+  echo ""
+done
+```
+
+Each workflow should show the `build-registries-conf` resource with `includeWhen` and the `mirrors.conf` data.
+
+---
+
+## Step 4: Configure a Component
+
+Default cache behavior:
+
+```yaml
+parameters:
+  cache:
+    mirror:
+      enabled: true
+    layers:
+      mode: reuse
+```
+
+Clean build that refreshes the layer cache:
+
+```yaml
+parameters:
+  cache:
+    mirror:
+      enabled: true
+    layers:
+      mode: rebuild
+```
+
+Fully uncached build:
+
+```yaml
+parameters:
+  cache:
+    mirror:
+      enabled: false
+    layers:
+      mode: disabled
+```
+
+Patch an existing component:
+
+```bash
+kubectl patch component my-service -n default --type merge -p '{"spec":{"parameters":{"cache":{"mirror":{"enabled":true},"layers":{"mode":"rebuild"}}}}}'
+```
+
+---
+
+## Step 5: Verify Caching
+
+### 5.1 Check registry health and catalog
+
+```bash
+kubectl -n openchoreo-workflow-plane port-forward svc/build-cache 5100:5100 &
+sleep 2
+curl -s http://localhost:5100/v2/_catalog
+kill %1
+```
+
+After cached builds complete, the catalog should include repositories like:
+
+```json
+{
+  "repositories": [
+    "build-cache/containerfile/default-myproject-myservice",
+    "build-cache/cnb/default-myproject-myservice",
+    "mirror/docker.io/paketobuildpacks/builder-jammy-full",
+    "mirror/ghcr.io/openchoreo/buildpack/ballerina"
+  ]
+}
+```
+
+### 5.2 Check build logs
+
+Mirror enabled (ConfigMap mounted):
+
+```text
+>> Upstream image mirror: mounted via registries.conf
+```
+
+Podman `Trying to pull` lines should show the Zot mirror URL first. If Zot has the image (or fetches it on-demand), the pull succeeds from the mirror. If not, Podman falls back to the upstream registry automatically.
+
+Layer cache reuse:
+
+```text
+>> Layer cache: reuse build-cache.openchoreo-workflow-plane.svc.cluster.local:5100/build-cache/containerfile/<component>
+```
+
+Layer cache rebuild:
+
+```text
+>> Layer cache: rebuild build-cache.openchoreo-workflow-plane.svc.cluster.local:5100/build-cache/containerfile/<component>
+```
+
+Registry unavailable:
+
+```text
+>> Cache registry not reachable, building without layer cache
+```
+
+Mirror disabled (no ConfigMap, no mirror log line) — Podman `Trying to pull` lines show upstream registry URLs directly.
+
+---
+
+## Disable / Uninstall
+
+### Disable cache for one component
+
+```yaml
+parameters:
+  cache:
+    mirror:
+      enabled: false
+    layers:
+      mode: disabled
+```
+
+### Remove Zot
+
+```bash
+kubectl delete deployment build-cache -n openchoreo-workflow-plane
+kubectl delete service build-cache -n openchoreo-workflow-plane
+kubectl delete configmap build-cache-config -n openchoreo-workflow-plane
+kubectl delete pvc build-cache-data -n openchoreo-workflow-plane
+```
+
+Builds continue to work normally. The `optional: true` ConfigMap mount means build pods start without the mirror config, and the cache probe falls back when Zot is unreachable.
+
+### Restore original workflow templates and CI workflows
+
+If the live objects were previously patched from `kubectl get -o yaml`, their
+`kubectl.kubernetes.io/last-applied-configuration` annotations might contain
+server-owned metadata such as `resourceVersion`. Remove those annotations before
+restoring with client-side apply:
+
+```bash
+kubectl annotate clusterworkflowtemplate \
+  containerfile-build \
+  paketo-buildpacks-build \
+  gcp-buildpacks-build \
+  ballerina-buildpack-build \
+  kubectl.kubernetes.io/last-applied-configuration-
+
+kubectl annotate clusterworkflow \
+  dockerfile-builder \
+  paketo-buildpacks-builder \
+  gcp-buildpacks-builder \
+  ballerina-buildpack-builder \
+  kubectl.kubernetes.io/last-applied-configuration-
+```
+
+Then apply the original manifests:
+
+```bash
+kubectl apply -f samples/getting-started/workflow-templates/containerfile-build.yaml
+kubectl apply -f samples/getting-started/workflow-templates/paketo-buildpacks-build.yaml
+kubectl apply -f samples/getting-started/workflow-templates/gcp-buildpacks-build.yaml
+kubectl apply -f samples/getting-started/workflow-templates/ballerina-buildpack-build.yaml
+
+kubectl apply -f samples/getting-started/ci-workflows/dockerfile-builder.yaml
+kubectl apply -f samples/getting-started/ci-workflows/paketo-buildpacks-builder.yaml
+kubectl apply -f samples/getting-started/ci-workflows/gcp-buildpacks-builder.yaml
+kubectl apply -f samples/getting-started/ci-workflows/ballerina-buildpack-builder.yaml
+```
+
+---
+
+## How It Works
+
+### Parameter flow
+
+```text
+Developer sets cache.mirror.enabled and cache.layers.mode
+  -> ClusterWorkflow schema validates cache.layers.mode enum
+    -> mirror.enabled=true: ClusterWorkflow creates registries-conf ConfigMap via includeWhen
+    -> runTemplate maps cache.layers.mode to Argo parameter
+      -> build step passes build-cache and cache-layers-mode to ClusterWorkflowTemplate
+        -> template mounts registries-conf ConfigMap (optional: true)
+          -> Podman reads registries.conf.d/mirrors.conf on every pull
+            -> All image pulls (FROM, builder, run, lifecycle) try Zot first, fall back to upstream
+          -> template probes Zot for layer cache
+            -> layers.mode reuse: read and write layer cache
+            -> layers.mode rebuild: skip read, write fresh cache
+```
+
+### Cache reference paths
+
+| Cache type | Reference pattern |
+|---|---|
+| Containerfile layer cache | `build-cache/containerfile/<namespace-project-component>` |
+| CNB layer cache | `build-cache/cnb/<namespace-project-component>:cnb-cache` |
+| CNB handoff image (temporary) | `build-tmp/cnb/<namespace-project-component>:<image-tag>-<git-revision>` |
+| Docker Hub mirror | `mirror/docker.io/<repo>` |
+| GCR mirror | `mirror/gcr.io/<repo>` |
+| GHCR mirror | `mirror/ghcr.io/<repo>` |
+| Quay mirror | `mirror/quay.io/<repo>` |
+
+### Cache mechanisms
+
+| Builder | `reuse` | `rebuild` |
+|---|---|---|
+| Podman Dockerfile | `--layers --cache-from=<ref> --cache-to=<ref>` | `--layers --cache-to=<ref>` |
+| Pack CLI Buildpacks | `--publish --cache-image=<ref>` | `--publish --cache-image=<ref> --clear-cache` |
+
+For Podman, the cache ref is intentionally an untagged repository. Podman writes content-addressed cache tags under that repository and rejects a tagged `--cache-to` reference such as `:buildcache`.
+
+For Pack CLI, registry cache requires `--publish`. The template publishes the built image to Zot, pulls it back into Podman with `--tls-verify=false`, tags it as the expected workflow image, and saves `/mnt/vol/app-image.tar` for the rest of the pipeline.
+
+Zot handles cleanup through online garbage collection and retention policies. GC runs without a separate CronJob.
+
+### Mirroring mechanism
+
+Mirroring uses a mounted `registries.conf` ConfigMap with `[[registry.mirror]]` entries. Podman tries the Zot mirror first and falls back to upstream if the mirror is unavailable or doesn't have the image.
+
+```toml
+[[registry]]
+location = "docker.io"
+[[registry.mirror]]
+location = "build-cache.openchoreo-workflow-plane.svc.cluster.local:5100/mirror/docker.io"
+insecure = true
+```
+
+Zot's sync config uses `onDemand: true` with a catch-all `"prefix": "/**"` content filter per registry. Any image from docker.io, gcr.io, ghcr.io, or quay.io is fetched and cached on first pull. Images are stored under `mirror/<registry>/` paths in Zot.
+
+Graceful degradation:
+- Mirror disabled (`cache.mirror.enabled: false`): ConfigMap is not created, `optional: true` volume mount is a no-op, Podman pulls from upstream
+- Zot unreachable: Podman tries the mirror, gets a connection error, falls back to upstream automatically
+- Image not in Zot cache: Zot fetches it on-demand from upstream, caches it, and serves it

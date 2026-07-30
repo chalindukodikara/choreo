@@ -1,0 +1,374 @@
+# Copyright 2025 The OpenChoreo Authors
+# SPDX-License-Identifier: Apache-2.0
+#
+# Namespace-scoped ComponentType for running the OpenClaw self-hosted gateway
+# (https://docs.openclaw.ai/) as a workload on OpenChoreo's data plane.
+#
+# OpenClaw bridges messaging channels (Slack / Discord / Teams / Telegram / WhatsApp)
+# to an AI coding agent. In this integration the agent talks back to OpenChoreo
+# through the MCP server at ${parameters.mcpServerURL}, so a developer can drive
+# component creation, CI, and CD from chat.
+#
+# This CT is deliberately scoped to a single namespace (`default`) so a platform
+# engineer can iterate on the shape without affecting shared cluster-wide types.
+# Promote to `ClusterComponentType` once the surface stabilises.
+---
+apiVersion: openchoreo.dev/v1alpha1
+kind: ComponentType
+metadata:
+  name: openclaw-gateway
+  namespace: default
+  annotations:
+    openchoreo.dev/display-name: OpenClaw Gateway
+    openchoreo.dev/description: |
+      Self-hosted OpenClaw gateway that bridges messaging channels to an AI
+      coding agent, wired to OpenChoreo via MCP for ChatOps-driven CI/CD.
+spec:
+  workloadType: deployment
+
+  # OpenClaw is deployed from a pre-built image that the PE picks — no build
+  # workflow is needed. Leaving allowedWorkflows empty forbids developer-side
+  # builds for this component type.
+  allowedWorkflows: []
+
+  # Only platform-provided traits; the one available in a default install is
+  # the observability alert rule.
+  allowedTraits:
+    - kind: ClusterTrait
+      name: observability-alert-rule
+
+  # Developer-settable fields (fixed for the life of the component).
+  parameters:
+    openAPIV3Schema:
+      type: object
+      properties:
+        # OpenClaw Gateway listens on 18789 by default; exposed so platform
+        # teams on shared ports can retune without editing the CT.
+        gatewayPort:
+          type: integer
+          default: 18789
+          minimum: 1024
+          maximum: 65535
+        # URL of the OpenChoreo MCP server the agent should call.
+        # In single-cluster local setups this is the in-cluster service DNS.
+        mcpServerURL:
+          type: string
+          default: http://openchoreo-api.openchoreo-control-plane.svc.cluster.local:8080/mcp
+        # Model provider family. Locked to Anthropic in the first iteration;
+        # extend once a multi-provider story is validated.
+        agentProvider:
+          type: string
+          enum:
+            - anthropic
+          default: anthropic
+        agentModel:
+          type: string
+          enum:
+            - claude-opus-4-6
+            - claude-sonnet-4-6
+            - claude-haiku-4-5
+          default: claude-sonnet-4-6
+        # Which messaging channels this gateway fronts. A matching secret
+        # reference must be bound in environmentConfigs.channelSecrets for
+        # each enabled channel (enforced by validations below).
+        enabledChannels:
+          type: array
+          default: []
+          minItems: 1
+          items:
+            type: string
+            enum:
+              - slack
+              - discord
+              - telegram
+              - teams
+              - whatsapp
+              - matrix
+              - signal
+              - imessage
+
+  # Per-environment overrides (bindable via ReleaseBinding.environmentConfigs).
+  environmentConfigs:
+    openAPIV3Schema:
+      type: object
+      properties:
+        # OpenClaw is a singleton per channel set — multiple replicas would
+        # cause duplicate message handling. Locked at 1 (see validations).
+        replicas:
+          type: integer
+          default: 1
+          minimum: 1
+          maximum: 1
+        imagePullPolicy:
+          type: string
+          default: IfNotPresent
+          enum:
+            - Always
+            - IfNotPresent
+            - Never
+        logLevel:
+          type: string
+          default: info
+          enum:
+            - debug
+            - info
+            - warn
+            - error
+        resources:
+          type: object
+          default: {}
+          properties:
+            requests:
+              type: object
+              default: {}
+              properties:
+                cpu:
+                  type: string
+                  default: "250m"
+                memory:
+                  type: string
+                  default: "512Mi"
+            limits:
+              type: object
+              default: {}
+              properties:
+                cpu:
+                  type: string
+                  default: "1"
+                memory:
+                  type: string
+                  default: "1Gi"
+        # Name of the ClusterSecretStore key holding the agent provider API key
+        # (used as AGENT_API_KEY inside the gateway). Defaults to a value seeded
+        # in the OpenBao dev store by the local-setup helper.
+        agentApiKeySecretKey:
+          type: string
+          default: openclaw-agent-api-key
+        # Per-channel bot-token secret keys in the ClusterSecretStore. Only
+        # entries for channels listed in parameters.enabledChannels are read.
+        channelSecrets:
+          type: object
+          default: {}
+          properties:
+            slack:
+              type: string
+              default: openclaw-slack-bot-token
+            discord:
+              type: string
+              default: openclaw-discord-bot-token
+            telegram:
+              type: string
+              default: openclaw-telegram-bot-token
+            teams:
+              type: string
+              default: openclaw-teams-bot-token
+            whatsapp:
+              type: string
+              default: openclaw-whatsapp-bot-token
+            matrix:
+              type: string
+              default: openclaw-matrix-bot-token
+            signal:
+              type: string
+              default: openclaw-signal-bot-token
+            imessage:
+              type: string
+              default: openclaw-imessage-bot-token
+
+  validations:
+    - rule: "${size(parameters.enabledChannels) > 0}"
+      message: "openclaw-gateway requires at least one messaging channel in parameters.enabledChannels."
+    - rule: "${environmentConfigs.replicas == 1}"
+      message: "openclaw-gateway is a singleton per channel set; replicas must equal 1."
+    - rule: "${size(workload.endpoints) > 0}"
+      message: "openclaw-gateway must declare an endpoint (typically 'gateway') in the Workload so the messaging webhooks can reach it."
+
+  resources:
+    # --- Deployment ---
+    - id: deployment
+      template:
+        apiVersion: apps/v1
+        kind: Deployment
+        metadata:
+          name: ${metadata.name}
+          namespace: ${metadata.namespace}
+          labels: ${metadata.labels}
+        spec:
+          replicas: ${environmentConfigs.replicas}
+          selector:
+            matchLabels: ${metadata.podSelectors}
+          template:
+            metadata:
+              labels: ${metadata.podSelectors}
+            spec:
+              containers:
+                - name: main
+                  image: ${workload.container.image}
+                  imagePullPolicy: ${environmentConfigs.imagePullPolicy}
+                  ports:
+                    - name: gateway
+                      containerPort: ${parameters.gatewayPort}
+                  env:
+                    - name: OPENCLAW_CONFIG_PATH
+                      value: /etc/openclaw/config.json
+                    - name: OPENCLAW_STATE_DIR
+                      value: /var/lib/openclaw
+                    - name: OPENCLAW_LOG_LEVEL
+                      value: ${environmentConfigs.logLevel}
+                    - name: OPENCLAW_MCP_SERVER_URL
+                      value: ${parameters.mcpServerURL}
+                    - name: OPENCLAW_AGENT_PROVIDER
+                      value: ${parameters.agentProvider}
+                    - name: OPENCLAW_AGENT_MODEL
+                      value: ${parameters.agentModel}
+                    - name: OPENCLAW_AGENT_API_KEY
+                      valueFrom:
+                        secretKeyRef:
+                          name: openclaw-gateway-channel-tokens
+                          key: agent-api-key
+                  envFrom:
+                    - secretRef:
+                        name: openclaw-gateway-channel-tokens
+                  resources:
+                    requests:
+                      cpu: ${environmentConfigs.resources.requests.cpu}
+                      memory: ${environmentConfigs.resources.requests.memory}
+                    limits:
+                      cpu: ${environmentConfigs.resources.limits.cpu}
+                      memory: ${environmentConfigs.resources.limits.memory}
+                  volumeMounts:
+                    - name: config
+                      mountPath: /etc/openclaw
+                      readOnly: true
+                    - name: state
+                      mountPath: /var/lib/openclaw
+              volumes:
+                - name: config
+                  configMap:
+                    name: ${metadata.componentName}-config
+                - name: state
+                  emptyDir: {}
+
+    # --- Service ---
+    - id: service
+      includeWhen: ${size(workload.endpoints) > 0}
+      template:
+        apiVersion: v1
+        kind: Service
+        metadata:
+          name: ${metadata.componentName}
+          namespace: ${metadata.namespace}
+          labels: ${metadata.labels}
+        spec:
+          selector: ${metadata.podSelectors}
+          type: ClusterIP
+          ports: ${workload.toServicePorts()}
+
+    # --- OpenClaw runtime config (JSON) ---
+    # The gateway reads this at startup. Channels not in enabledChannels are
+    # left out so the gateway never tries to authenticate against them.
+    - id: openclaw-config
+      template:
+        apiVersion: v1
+        kind: ConfigMap
+        metadata:
+          name: ${metadata.componentName}-config
+          namespace: ${metadata.namespace}
+          labels: ${metadata.labels}
+        data:
+          config.json: |
+            {
+              "gateway": {
+                "port": ${parameters.gatewayPort},
+                "controlUi": { "enabled": true }
+              },
+              "agent": {
+                "provider": "${parameters.agentProvider}",
+                "model": "${parameters.agentModel}",
+                "mcp": { "servers": [{ "url": "${parameters.mcpServerURL}" }] }
+              },
+              "channels": ${parameters.enabledChannels.map(c, {"type": c, "tokenEnv": "OPENCLAW_" + c.upperAscii() + "_TOKEN"})}
+            }
+
+    # --- Channel-token ExternalSecret ---
+    # Pulls each enabled channel's bot token (and the agent API key) from the
+    # ClusterSecretStore into a Secret that the Deployment consumes via envFrom.
+    - id: channel-tokens-secret
+      template:
+        apiVersion: external-secrets.io/v1
+        kind: ExternalSecret
+        metadata:
+          name: openclaw-gateway-channel-tokens
+          namespace: ${metadata.namespace}
+          labels: ${metadata.labels}
+        spec:
+          refreshInterval: 1m
+          secretStoreRef:
+            kind: ClusterSecretStore
+            name: ${dataplane.secretStore}
+          target:
+            name: openclaw-gateway-channel-tokens
+            creationPolicy: Owner
+          data:
+            - secretKey: agent-api-key
+              remoteRef:
+                key: ${environmentConfigs.agentApiKeySecretKey}
+                property: value
+            # One envFrom key per enabled channel, named OPENCLAW_<CHANNEL>_TOKEN.
+            # The map lookup below keys into environmentConfigs.channelSecrets.
+            - secretKey: OPENCLAW_SLACK_TOKEN
+              remoteRef:
+                key: ${environmentConfigs.channelSecrets.slack}
+                property: value
+            - secretKey: OPENCLAW_DISCORD_TOKEN
+              remoteRef:
+                key: ${environmentConfigs.channelSecrets.discord}
+                property: value
+            - secretKey: OPENCLAW_TELEGRAM_TOKEN
+              remoteRef:
+                key: ${environmentConfigs.channelSecrets.telegram}
+                property: value
+            - secretKey: OPENCLAW_TEAMS_TOKEN
+              remoteRef:
+                key: ${environmentConfigs.channelSecrets.teams}
+                property: value
+            - secretKey: OPENCLAW_WHATSAPP_TOKEN
+              remoteRef:
+                key: ${environmentConfigs.channelSecrets.whatsapp}
+                property: value
+            - secretKey: OPENCLAW_MATRIX_TOKEN
+              remoteRef:
+                key: ${environmentConfigs.channelSecrets.matrix}
+                property: value
+            - secretKey: OPENCLAW_SIGNAL_TOKEN
+              remoteRef:
+                key: ${environmentConfigs.channelSecrets.signal}
+                property: value
+            - secretKey: OPENCLAW_IMESSAGE_TOKEN
+              remoteRef:
+                key: ${environmentConfigs.channelSecrets.imessage}
+                property: value
+
+    # --- External HTTPRoute for the OpenClaw Web Control UI ---
+    - id: httproute-external
+      forEach: '${workload.endpoints.transformMap(name, ep, "external" in ep.visibility && ep.type in ["HTTP", "Websocket"], ep)}'
+      var: endpoint
+      template:
+        apiVersion: gateway.networking.k8s.io/v1
+        kind: HTTPRoute
+        metadata:
+          name: ${oc_generate_name(metadata.componentName, endpoint.key)}
+          namespace: ${metadata.namespace}
+          labels: '${oc_merge(metadata.labels, {"openchoreo.dev/endpoint-name": endpoint.key, "openchoreo.dev/endpoint-visibility": "external"})}'
+        spec:
+          hostnames: |
+            ${[gateway.ingress.external.?http, gateway.ingress.external.?https]
+              .filter(g, g.hasValue()).map(g, g.value().host).distinct()
+              .map(h, oc_dns_label(endpoint.key, metadata.componentName, metadata.environmentName, metadata.componentNamespace) + "." + h)}
+          parentRefs:
+            - name: ${gateway.ingress.external.name}
+              namespace: ${gateway.ingress.external.namespace}
+          rules:
+            - backendRefs:
+                - name: ${metadata.componentName}
+                  port: ${endpoint.value.port}

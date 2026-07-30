@@ -1,0 +1,123 @@
+# Rootful Dockerfile/Containerfile build using BuildKit in a user namespace,
+# with optional registry-based layer caching.
+#
+# Based on containerfile-build.yaml (buildkit rootless, no caching).
+# Adds: build-cache parameter, buildkitd.toml for insecure HTTP cache,
+# --import-cache / --export-cache with mode=max for full layer reuse.
+#
+# When build-cache is deployed: probe succeeds → caching enabled automatically.
+# When build-cache is absent: probe fails → builds proceed without cache.
+# When build-cache is "none": probe skipped → caching disabled explicitly.
+#
+# Cache key: build-cache/buildkit/<image-name>:buildcache (scoped per component).
+#
+# Prerequisites:
+#   - Kubernetes 1.33+ with UserNamespacesSupport (GA, enabled by default)
+#   - containerd 2.x as container runtime
+#
+# Output: docker-format tarball at /mnt/vol/app-image.tar
+apiVersion: argoproj.io/v1alpha1
+kind: ClusterWorkflowTemplate
+metadata:
+  name: containerfile-build
+spec:
+  templates:
+    - name: build-image
+      podSpecPatch: '{"hostUsers": false}'
+      inputs:
+        parameters:
+          - name: git-revision
+          - name: build-env
+          - name: build-args
+          - name: build-cache
+            default: ""
+      volumes:
+        - name: storage
+          emptyDir:
+            sizeLimit: 10Gi
+      container:
+        image: moby/buildkit:v0.29.0
+        command:
+          - sh
+          - -c
+        args:
+          - |-
+            set -e
+
+            WORKDIR="/mnt/vol/source"
+            IMAGE_NAME="{{workflow.parameters.image-name}}"
+            IMAGE="${IMAGE_NAME}:{{workflow.parameters.image-tag}}-{{inputs.parameters.git-revision}}"
+            DOCKER_CONTEXT="{{workflow.parameters.docker-context}}"
+            DOCKERFILE_PATH="{{workflow.parameters.dockerfile-path}}"
+            BUILD_ARGS_JSON='{{inputs.parameters.build-args}}'
+            CACHE_REGISTRY="{{inputs.parameters.build-cache}}"
+
+            echo ">> [buildkit] Image: $IMAGE"
+            echo ">> Dockerfile: $DOCKERFILE_PATH"
+            echo ">> Docker context: $DOCKER_CONTEXT"
+
+            if [ ! -f "$WORKDIR/$DOCKERFILE_PATH" ]; then
+              echo ">> Error: Dockerfile not found at: '$DOCKERFILE_PATH'"
+              echo ">> Repository contents:"
+              ls -la "$WORKDIR/"
+              exit 1
+            fi
+
+            if [ ! -d "$WORKDIR/$DOCKER_CONTEXT" ]; then
+              echo ">> Error: Docker build context directory not found: '$DOCKER_CONTEXT'"
+              echo ">> Repository contents:"
+              ls -la "$WORKDIR/"
+              exit 1
+            fi
+
+            BUILD_ARG_OPTS=""
+            if [ -n "$BUILD_ARGS_JSON" ] && [ "$BUILD_ARGS_JSON" != "[]" ]; then
+              apk add --no-cache jq > /dev/null 2>&1 || true
+              BUILD_ARG_OPTS=$(echo "$BUILD_ARGS_JSON" | \
+                jq -r '.[] | "--opt build-arg:\(.name)=\(.value)"' | \
+                tr '\n' ' ')
+            fi
+
+            DOCKERFILE_DIR=$(dirname "$WORKDIR/$DOCKERFILE_PATH")
+            DOCKERFILE_NAME=$(basename "$DOCKERFILE_PATH")
+
+            # --- Layer cache configuration ---
+            CACHE_ARGS=""
+            if [ -n "$CACHE_REGISTRY" ] && [ "$CACHE_REGISTRY" != "none" ]; then
+              if wget -q --spider --timeout=3 "http://${CACHE_REGISTRY}/v2/" 2>/dev/null; then
+                CACHE_REF="${CACHE_REGISTRY}/build-cache/buildkit/${IMAGE_NAME}:buildcache"
+                CACHE_ARGS="--import-cache type=registry,ref=${CACHE_REF} --export-cache type=registry,ref=${CACHE_REF},mode=max,ignore-error=true"
+                cat > /tmp/buildkitd.toml <<BKEOF
+            [registry."${CACHE_REGISTRY}"]
+              http = true
+              insecure = true
+            BKEOF
+                export BUILDKITD_FLAGS="--root=/storage --config=/tmp/buildkitd.toml"
+                echo ">> Layer cache: ${CACHE_REF}"
+              else
+                echo ">> Cache registry not reachable at ${CACHE_REGISTRY}, building without cache"
+              fi
+            fi
+
+            echo ">> Building image with BuildKit (rootful, user namespace)"
+            buildctl-daemonless.sh build \
+              --frontend dockerfile.v0 \
+              --local context="$WORKDIR/$DOCKER_CONTEXT" \
+              --local dockerfile="$DOCKERFILE_DIR" \
+              --opt filename="$DOCKERFILE_NAME" \
+              $BUILD_ARG_OPTS \
+              $CACHE_ARGS \
+              --output "type=docker,name=$IMAGE,dest=/mnt/vol/app-image.tar"
+
+            echo ">> Image built successfully"
+            echo ">> Image saved to /mnt/vol/app-image.tar"
+        env:
+          - name: BUILDKITD_FLAGS
+            value: "--root=/storage"
+        securityContext:
+          privileged: true
+        volumeMounts:
+          - mountPath: /mnt/vol
+            name: workspace
+          - mountPath: /storage
+            name: storage

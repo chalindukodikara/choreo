@@ -1,0 +1,720 @@
+openapi: 3.0.3
+info:
+  title: OpenChoreo CI Module Adapter API
+  version: 0.1.0-draft
+  description: |
+    The **standardized adapter contract** every OpenChoreo CI Module must implement, as
+    described in `DISCUSSION.md` and `API-claude.md`.
+
+    The OpenChoreo API server is the **only** intended caller. For any operational request
+    (logs, events, live status, cancel, artifacts, list) it resolves the target workflow's
+    `spec.class` and the adapter `Service` name (`WorkflowPlane.spec.adapterServiceName`, or
+    the `Workflow.spec.adapterServiceName` override for engines with no plane) and proxies
+    the request here.
+
+    ## Design notes
+    - Operational paths intentionally mirror the core OpenChoreo API
+      (`/namespaces/{namespace}/workflowruns/{runName}/...`) so the core server can proxy
+      transparently and reuse the same response schemas (`WorkflowRunLogEntry`,
+      `WorkflowRunEventEntry`, `WorkflowRunStatusResponse`).
+    - Adapters are stateless-friendly: the core server injects the engine-side run handle
+      and plane coordinates as `X-OpenChoreo-*` headers, so an adapter need not have
+      control-plane RBAC. A Kubernetes-native adapter MAY instead read the CR itself.
+    - Optional features are advertised via `GET /capabilities`; clients must not call an
+      endpoint whose capability flag is false.
+  license:
+    name: Apache 2.0
+    url: https://www.apache.org/licenses/LICENSE-2.0.html
+
+servers:
+  - url: http://{adapterServiceName}/api/v1
+    description: In-cluster adapter Service (resolved from adapterServiceName)
+    variables:
+      adapterServiceName:
+        default: argo-ci-adapter
+
+tags:
+  - name: Health
+  - name: Capabilities
+  - name: Runs
+    description: Operational data for workflow runs (logs, events, status, detail, cancel)
+  - name: Artifacts
+  - name: SCM
+    description: Optional source-control helpers backed by the module's git credential
+
+paths:
+  # ---------------------------------------------------------------------------
+  # Health & capabilities
+  # ---------------------------------------------------------------------------
+  /healthz:
+    get:
+      operationId: getHealthz
+      summary: Liveness probe
+      tags: [Health]
+      security: []
+      responses:
+        '200':
+          description: Adapter is alive
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/HealthStatus' }
+
+  /readyz:
+    get:
+      operationId: getReadyz
+      summary: Readiness probe
+      tags: [Health]
+      security: []
+      responses:
+        '200':
+          description: Adapter is ready to serve
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/HealthStatus' }
+        '503':
+          description: Adapter not ready (e.g. cannot reach the engine)
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/HealthStatus' }
+
+  /capabilities:
+    get:
+      operationId: getCapabilities
+      summary: Advertise module capabilities
+      description: |
+        Declares the engine `class`, whether it is Kubernetes-native, and which optional
+        features the adapter implements. Clients use this to enable/disable actions and to
+        decide whether to render an external deep-link, prompt for a git secret, etc.
+      tags: [Capabilities]
+      responses:
+        '200':
+          description: Capabilities
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Capabilities' }
+
+  # ---------------------------------------------------------------------------
+  # Run operational data (required)
+  # ---------------------------------------------------------------------------
+  /namespaces/{namespace}/workflowruns/{runName}/status:
+    get:
+      operationId: getRunStatus
+      summary: Get live run status
+      description: |
+        Returns the authoritative **live** status and per-step status from the engine.
+        Replaces the Argo-specific liveness probe and live portion of the core server's
+        `GetWorkflowRunStatus`. `hasLiveObservability` is true while the engine still holds
+        the run (i.e. logs/events are fetchable).
+      tags: [Runs]
+      parameters:
+        - $ref: '#/components/parameters/Namespace'
+        - $ref: '#/components/parameters/RunName'
+        - $ref: '#/components/parameters/HdrClass'
+        - $ref: '#/components/parameters/HdrRunReference'
+        - $ref: '#/components/parameters/HdrPlaneType'
+        - $ref: '#/components/parameters/HdrPlaneId'
+        - $ref: '#/components/parameters/HdrPlaneNamespace'
+        - $ref: '#/components/parameters/HdrPlaneName'
+      responses:
+        '200':
+          description: Run status
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/WorkflowRunStatusResponse' }
+        '404': { $ref: '#/components/responses/NotFound' }
+        '500': { $ref: '#/components/responses/InternalError' }
+
+  /namespaces/{namespace}/workflowruns/{runName}/logs:
+    get:
+      operationId: getRunLogs
+      summary: Get run logs
+      description: |
+        Returns logs for the run, optionally scoped to a single task. Replaces the core
+        server's `GetWorkflowRunLogs`. Baseline response is a JSON array of
+        `WorkflowRunLogEntry`. When `follow=true` and the `streamingLogs` capability is
+        advertised, the adapter MAY instead return `text/event-stream`.
+      tags: [Runs]
+      parameters:
+        - $ref: '#/components/parameters/Namespace'
+        - $ref: '#/components/parameters/RunName'
+        - name: task
+          in: query
+          required: false
+          description: Filter logs to a single task/step name.
+          schema: { type: string }
+        - name: sinceSeconds
+          in: query
+          required: false
+          description: Only return logs newer than this many seconds.
+          schema: { type: integer, format: int64, minimum: 0 }
+        - name: tailLines
+          in: query
+          required: false
+          description: Return only the last N lines per task.
+          schema: { type: integer, format: int64, minimum: 0 }
+        - name: follow
+          in: query
+          required: false
+          description: Stream logs (requires the streamingLogs capability).
+          schema: { type: boolean, default: false }
+        - $ref: '#/components/parameters/HdrClass'
+        - $ref: '#/components/parameters/HdrRunReference'
+        - $ref: '#/components/parameters/HdrPlaneType'
+        - $ref: '#/components/parameters/HdrPlaneId'
+        - $ref: '#/components/parameters/HdrPlaneNamespace'
+        - $ref: '#/components/parameters/HdrPlaneName'
+      responses:
+        '200':
+          description: Log entries
+          content:
+            application/json:
+              schema:
+                type: array
+                items: { $ref: '#/components/schemas/WorkflowRunLogEntry' }
+            text/event-stream:
+              schema:
+                type: string
+                description: SSE stream of WorkflowRunLogEntry objects (when follow=true).
+        '400': { $ref: '#/components/responses/BadRequest' }
+        '404': { $ref: '#/components/responses/NotFound' }
+        '500': { $ref: '#/components/responses/InternalError' }
+
+  /namespaces/{namespace}/workflowruns/{runName}/events:
+    get:
+      operationId: getRunEvents
+      summary: Get run events
+      description: |
+        Returns events for the run, optionally scoped to a single task. Replaces the core
+        server's `GetWorkflowRunEvents`. For Kubernetes-native engines these are pod/object
+        events; for external engines they are normalized engine events.
+      tags: [Runs]
+      parameters:
+        - $ref: '#/components/parameters/Namespace'
+        - $ref: '#/components/parameters/RunName'
+        - name: task
+          in: query
+          required: false
+          description: Filter events to a single task/step name.
+          schema: { type: string }
+        - $ref: '#/components/parameters/HdrClass'
+        - $ref: '#/components/parameters/HdrRunReference'
+        - $ref: '#/components/parameters/HdrPlaneType'
+        - $ref: '#/components/parameters/HdrPlaneId'
+        - $ref: '#/components/parameters/HdrPlaneNamespace'
+        - $ref: '#/components/parameters/HdrPlaneName'
+      responses:
+        '200':
+          description: Event entries
+          content:
+            application/json:
+              schema:
+                type: array
+                items: { $ref: '#/components/schemas/WorkflowRunEventEntry' }
+        '404': { $ref: '#/components/responses/NotFound' }
+        '500': { $ref: '#/components/responses/InternalError' }
+
+  /namespaces/{namespace}/workflowruns/{runName}:
+    get:
+      operationId: getRunDetail
+      summary: Get engine-side run detail
+      description: |
+        Returns the engine-side view of the run, including data not mirrored into the
+        `WorkflowRun` CR — the external run id, a deep-link `externalUrl` (e.g. the GitHub
+        Actions run page), engine conclusion and timing. Required for external engines whose
+        run state does not live in Kubernetes.
+      tags: [Runs]
+      parameters:
+        - $ref: '#/components/parameters/Namespace'
+        - $ref: '#/components/parameters/RunName'
+        - $ref: '#/components/parameters/HdrClass'
+        - $ref: '#/components/parameters/HdrRunReference'
+        - $ref: '#/components/parameters/HdrPlaneType'
+        - $ref: '#/components/parameters/HdrPlaneId'
+        - $ref: '#/components/parameters/HdrPlaneNamespace'
+        - $ref: '#/components/parameters/HdrPlaneName'
+      responses:
+        '200':
+          description: Run detail
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/RunDetail' }
+        '404': { $ref: '#/components/responses/NotFound' }
+        '500': { $ref: '#/components/responses/InternalError' }
+
+  /namespaces/{namespace}/workflowruns/{runName}/cancel:
+    post:
+      operationId: cancelRun
+      summary: Cancel a run
+      description: |
+        Cancels/aborts the run in the engine (Argo `stop`, Tekton cancel, GitHub Actions
+        cancel, Jenkins stop). Only valid when `capabilities.features.cancel` is true.
+      tags: [Runs]
+      parameters:
+        - $ref: '#/components/parameters/Namespace'
+        - $ref: '#/components/parameters/RunName'
+        - $ref: '#/components/parameters/HdrClass'
+        - $ref: '#/components/parameters/HdrRunReference'
+        - $ref: '#/components/parameters/HdrPlaneType'
+        - $ref: '#/components/parameters/HdrPlaneId'
+        - $ref: '#/components/parameters/HdrPlaneNamespace'
+        - $ref: '#/components/parameters/HdrPlaneName'
+      responses:
+        '202':
+          description: Cancellation accepted
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/WorkflowRunStatusResponse' }
+        '404': { $ref: '#/components/responses/NotFound' }
+        '409':
+          description: Run already terminal; nothing to cancel
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Error' }
+        '501':
+          description: Cancel not supported by this module
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Error' }
+        '500': { $ref: '#/components/responses/InternalError' }
+
+  # ---------------------------------------------------------------------------
+  # Artifacts (optional capability)
+  # ---------------------------------------------------------------------------
+  /namespaces/{namespace}/workflowruns/{runName}/artifacts:
+    get:
+      operationId: listRunArtifacts
+      summary: List run artifacts
+      description: Lists artifacts produced by the run. Requires the `artifacts` capability.
+      tags: [Artifacts]
+      parameters:
+        - $ref: '#/components/parameters/Namespace'
+        - $ref: '#/components/parameters/RunName'
+        - $ref: '#/components/parameters/HdrClass'
+        - $ref: '#/components/parameters/HdrRunReference'
+      responses:
+        '200':
+          description: Artifact list
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/ArtifactList' }
+        '404': { $ref: '#/components/responses/NotFound' }
+        '501':
+          description: Artifacts not supported by this module
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Error' }
+        '500': { $ref: '#/components/responses/InternalError' }
+
+  # ---------------------------------------------------------------------------
+  # List runs from the engine (optional; for external engines)
+  # ---------------------------------------------------------------------------
+  /namespaces/{namespace}/workflowruns:
+    get:
+      operationId: listRuns
+      summary: List runs from the engine
+      description: |
+        Lists runs as known to the engine, for engines whose runs are **not** mirrored as
+        `WorkflowRun` CRs (e.g. GitHub Actions, Jenkins). Kubernetes-native modules normally
+        do not implement this (the core server lists `WorkflowRun` CRs directly). Requires
+        the `list` capability.
+      tags: [Runs]
+      parameters:
+        - $ref: '#/components/parameters/Namespace'
+        - name: project
+          in: query
+          required: false
+          schema: { type: string }
+        - name: component
+          in: query
+          required: false
+          schema: { type: string }
+        - name: limit
+          in: query
+          required: false
+          schema: { type: integer, minimum: 1, maximum: 200, default: 50 }
+        - name: cursor
+          in: query
+          required: false
+          schema: { type: string }
+        - $ref: '#/components/parameters/HdrClass'
+      responses:
+        '200':
+          description: Run summaries
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/RunSummaryList' }
+        '501':
+          description: List not supported by this module
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Error' }
+        '500': { $ref: '#/components/responses/InternalError' }
+
+  # ---------------------------------------------------------------------------
+  # SCM helpers (optional capability) — backed by the module's git credential
+  # ---------------------------------------------------------------------------
+  /namespaces/{namespace}/scm/branches:
+    get:
+      operationId: listScmBranches
+      summary: List branches for a repository
+      description: |
+        Lists branches of a repository using the module's stored git credential. Optional
+        value-add called out in `DISCUSSION.md` (browse branches/commits/PRs alongside CI).
+        Requires the `scm` capability.
+      tags: [SCM]
+      parameters:
+        - $ref: '#/components/parameters/Namespace'
+        - name: repository
+          in: query
+          required: true
+          description: Repository URL or owner/name identifier.
+          schema: { type: string }
+      responses:
+        '200':
+          description: Branch names
+          content:
+            application/json:
+              schema:
+                type: array
+                items: { $ref: '#/components/schemas/ScmBranch' }
+        '501':
+          description: SCM helpers not supported by this module
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Error' }
+        '500': { $ref: '#/components/responses/InternalError' }
+
+  /namespaces/{namespace}/scm/commits:
+    get:
+      operationId: listScmCommits
+      summary: List commits for a repository branch
+      tags: [SCM]
+      parameters:
+        - $ref: '#/components/parameters/Namespace'
+        - name: repository
+          in: query
+          required: true
+          schema: { type: string }
+        - name: branch
+          in: query
+          required: false
+          schema: { type: string }
+        - name: limit
+          in: query
+          required: false
+          schema: { type: integer, minimum: 1, maximum: 100, default: 30 }
+      responses:
+        '200':
+          description: Commits
+          content:
+            application/json:
+              schema:
+                type: array
+                items: { $ref: '#/components/schemas/ScmCommit' }
+        '501':
+          description: SCM helpers not supported by this module
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Error' }
+        '500': { $ref: '#/components/responses/InternalError' }
+
+components:
+  # ---------------------------------------------------------------------------
+  # Shared parameters
+  # ---------------------------------------------------------------------------
+  parameters:
+    Namespace:
+      name: namespace
+      in: path
+      required: true
+      description: OpenChoreo namespace (organization) of the WorkflowRun.
+      schema: { type: string }
+    RunName:
+      name: runName
+      in: path
+      required: true
+      description: Name of the WorkflowRun CR.
+      schema: { type: string }
+
+    HdrClass:
+      name: X-OpenChoreo-Workflow-Class
+      in: header
+      required: false
+      description: Resolved workflow class (e.g. argo, tekton, github-actions).
+      schema: { type: string }
+    HdrRunReference:
+      name: X-OpenChoreo-Run-Reference
+      in: header
+      required: false
+      description: |
+        JSON-encoded engine-side handle from `WorkflowRun.Status.RunReference`
+        ({apiVersion,kind,name,namespace}). For external engines this MAY encode an opaque
+        external run id instead.
+      schema: { type: string }
+    HdrPlaneType:
+      name: X-OpenChoreo-Plane-Type
+      in: header
+      required: false
+      description: Resolved plane type (workflowplane or observabilityplane). Omitted for external engines.
+      schema:
+        type: string
+        enum: [workflowplane, observabilityplane]
+    HdrPlaneId:
+      name: X-OpenChoreo-Plane-Id
+      in: header
+      required: false
+      description: Resolved plane ID used by the cluster gateway to route to the plane cluster.
+      schema: { type: string }
+    HdrPlaneNamespace:
+      name: X-OpenChoreo-Plane-Namespace
+      in: header
+      required: false
+      description: Namespace of the resolved plane CR ("_cluster" for cluster-scoped planes).
+      schema: { type: string }
+    HdrPlaneName:
+      name: X-OpenChoreo-Plane-Name
+      in: header
+      required: false
+      description: Name of the resolved plane CR.
+      schema: { type: string }
+
+  # ---------------------------------------------------------------------------
+  # Shared responses
+  # ---------------------------------------------------------------------------
+  responses:
+    BadRequest:
+      description: Invalid request
+      content:
+        application/json:
+          schema: { $ref: '#/components/schemas/Error' }
+    NotFound:
+      description: Run not found
+      content:
+        application/json:
+          schema: { $ref: '#/components/schemas/Error' }
+    InternalError:
+      description: Internal adapter error
+      content:
+        application/json:
+          schema: { $ref: '#/components/schemas/Error' }
+
+  # ---------------------------------------------------------------------------
+  # Schemas
+  # ---------------------------------------------------------------------------
+  schemas:
+    Error:
+      type: object
+      description: Error envelope, matching the core OpenChoreo API error shape.
+      required: [success, error]
+      properties:
+        success: { type: boolean, example: false }
+        error: { type: string }
+        code: { type: string }
+
+    HealthStatus:
+      type: object
+      required: [status]
+      properties:
+        status:
+          type: string
+          enum: [ok, degraded, unavailable]
+        message: { type: string }
+
+    Capabilities:
+      type: object
+      description: Module capability and metadata advertisement.
+      required: [class, kubernetesNative, features]
+      properties:
+        class:
+          type: string
+          description: Engine class this adapter serves (matches Workflow.spec.class).
+          example: argo
+        displayName:
+          type: string
+          example: Argo Workflows
+        version:
+          type: string
+          description: Adapter/module version.
+        kubernetesNative:
+          type: boolean
+          description: Whether runs execute as Kubernetes objects on a workflow plane.
+        requiresGitSecret:
+          type: boolean
+          description: |
+            Whether builds need an OpenChoreo-managed git secret on the plane. External
+            engines that own their credentials set this false.
+        features:
+          type: object
+          description: Which optional endpoints this adapter implements.
+          properties:
+            logs: { type: boolean }
+            events: { type: boolean }
+            status: { type: boolean }
+            cancel: { type: boolean }
+            artifacts: { type: boolean }
+            list: { type: boolean }
+            streamingLogs: { type: boolean }
+            scm: { type: boolean }
+
+    # ----- Reused verbatim from internal/openchoreo-api/models -----
+    WorkflowRunStatusResponse:
+      type: object
+      description: Reused from the core API (models.WorkflowRunStatusResponse).
+      required: [status, steps, hasLiveObservability]
+      properties:
+        status:
+          type: string
+          description: Overall run status.
+          enum: [Pending, Running, Succeeded, Failed]
+        steps:
+          type: array
+          items: { $ref: '#/components/schemas/WorkflowStepStatus' }
+        hasLiveObservability:
+          type: boolean
+          description: Whether the engine still holds the run so logs/events are fetchable.
+
+    WorkflowStepStatus:
+      type: object
+      description: Reused from the core API (models.WorkflowStepStatus).
+      required: [name, phase]
+      properties:
+        name: { type: string }
+        phase:
+          type: string
+          enum: [Pending, Running, Succeeded, Failed, Skipped, Error]
+        startedAt: { type: string, format: date-time, nullable: true }
+        finishedAt: { type: string, format: date-time, nullable: true }
+
+    WorkflowRunLogEntry:
+      type: object
+      description: Reused from the core API (models.WorkflowRunLogEntry).
+      required: [log]
+      properties:
+        timestamp: { type: string }
+        log: { type: string }
+
+    WorkflowRunEventEntry:
+      type: object
+      description: Reused from the core API (models.WorkflowRunEventEntry).
+      required: [timestamp, type, reason, message]
+      properties:
+        timestamp: { type: string }
+        type: { type: string }
+        reason: { type: string }
+        message: { type: string }
+
+    # ----- New adapter-only schemas -----
+    RunReference:
+      type: object
+      description: Engine-side handle, mirrors api/v1alpha1 ResourceReference.
+      properties:
+        apiVersion: { type: string }
+        kind: { type: string }
+        name: { type: string }
+        namespace: { type: string }
+
+    RunDetail:
+      type: object
+      description: Engine-side view of a run, including data not stored in the WorkflowRun CR.
+      required: [name, status]
+      properties:
+        name:
+          type: string
+          description: WorkflowRun name.
+        externalId:
+          type: string
+          description: Engine-native run identifier (e.g. GitHub Actions run id).
+        externalUrl:
+          type: string
+          description: Deep link to the run in the engine's UI.
+        status:
+          type: string
+          enum: [Pending, Running, Succeeded, Failed]
+        conclusion:
+          type: string
+          description: Engine-native conclusion, if any (e.g. success, cancelled, timed_out).
+        startedAt: { type: string, format: date-time, nullable: true }
+        finishedAt: { type: string, format: date-time, nullable: true }
+        steps:
+          type: array
+          items: { $ref: '#/components/schemas/WorkflowStepStatus' }
+        runReference: { $ref: '#/components/schemas/RunReference' }
+
+    RunSummary:
+      type: object
+      required: [name, status]
+      properties:
+        name: { type: string }
+        externalId: { type: string }
+        externalUrl: { type: string }
+        project: { type: string }
+        component: { type: string }
+        commit: { type: string }
+        status:
+          type: string
+          enum: [Pending, Running, Succeeded, Failed]
+        startedAt: { type: string, format: date-time, nullable: true }
+        finishedAt: { type: string, format: date-time, nullable: true }
+
+    RunSummaryList:
+      type: object
+      required: [items]
+      properties:
+        items:
+          type: array
+          items: { $ref: '#/components/schemas/RunSummary' }
+        pagination:
+          type: object
+          properties:
+            nextCursor: { type: string }
+            remainingCount: { type: integer, format: int64, nullable: true }
+
+    Artifact:
+      type: object
+      required: [name]
+      properties:
+        name: { type: string }
+        sizeBytes: { type: integer, format: int64 }
+        url:
+          type: string
+          description: Download URL (may be a presigned or engine-proxied URL).
+        contentType: { type: string }
+
+    ArtifactList:
+      type: object
+      required: [items]
+      properties:
+        items:
+          type: array
+          items: { $ref: '#/components/schemas/Artifact' }
+
+    ScmBranch:
+      type: object
+      required: [name]
+      properties:
+        name: { type: string }
+        commit: { type: string }
+        protected: { type: boolean }
+
+    ScmCommit:
+      type: object
+      required: [sha]
+      properties:
+        sha: { type: string }
+        message: { type: string }
+        author: { type: string }
+        committedAt: { type: string, format: date-time }
+        url: { type: string }
+
+  securitySchemes:
+    serviceToken:
+      type: http
+      scheme: bearer
+      description: |
+        In-cluster service-to-service auth between the OpenChoreo API server and the
+        adapter. The core server also forwards X-OpenChoreo-Subject for the adapter's own
+        auditing. Authorization of the end user is performed by the core server before the
+        proxy; the adapter trusts the core server as its sole caller.
+
+security:
+  - serviceToken: []

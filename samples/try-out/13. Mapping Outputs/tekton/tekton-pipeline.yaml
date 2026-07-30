@@ -1,0 +1,616 @@
+# =============================================================================
+# Tekton equivalent of the Argo Workflow + ClusterWorkflowTemplate
+# =============================================================================
+# In Tekton, the ClusterWorkflowTemplate maps to individual ClusterTasks,
+# and the Workflow maps to a PipelineRun referencing a Pipeline.
+# =============================================================================
+
+---
+# -----------------------------------------------------------------------------
+# ClusterTask 1: checkout-source
+# Equivalent to Argo's "checkout-source" template
+# -----------------------------------------------------------------------------
+apiVersion: tekton.dev/v1
+kind: ClusterTask
+metadata:
+  name: checkout-source
+spec:
+  # Tekton "params" = Argo "workflow.parameters" accessed inside steps
+  params:
+    - name: branch
+      type: string
+    - name: git-repo
+      type: string
+    - name: commit
+      type: string
+      default: ""
+    - name: git-secret
+      type: string
+      default: ""
+  # Tekton "results" = Argo "outputs.parameters"
+  # Instead of writing to a file and declaring valueFrom.path,
+  # Tekton writes to $(results.<name>.path)
+  results:
+    - name: git-revision
+      description: Short SHA of the checked-out commit
+  workspaces:
+    - name: source
+      description: Shared workspace for source code
+  volumes:
+    - name: git-secret
+      secret:
+        secretName: $(params.git-secret)
+        optional: true
+  steps:
+    - name: clone
+      image: alpine/git
+      volumeMounts:
+        - name: git-secret
+          mountPath: /etc/secrets/git-secret
+          readOnly: true
+      script: |
+        #!/bin/sh
+        set -e
+
+        BRANCH=$(params.branch)
+        REPO=$(params.git-repo)
+        COMMIT=$(params.commit)
+        GIT_SECRET_PATH="/etc/secrets/git-secret"
+
+        # ... (same git auth logic as Argo version) ...
+
+        if [ -n "$COMMIT" ]; then
+          git clone --no-checkout --depth 1 "$REPO" $(workspaces.source.path)/source
+          cd $(workspaces.source.path)/source
+          git config --global advice.detachedHead false
+          git fetch --depth 1 origin "$COMMIT"
+          git checkout "$COMMIT"
+          echo -n "$COMMIT" | cut -c1-8 > $(results.git-revision.path)
+        else
+          git clone --single-branch --branch $BRANCH --depth 1 "$REPO" $(workspaces.source.path)/source
+          cd $(workspaces.source.path)/source
+          COMMIT_SHA=$(git rev-parse HEAD)
+          echo -n "$COMMIT_SHA" | cut -c1-8 > $(results.git-revision.path)
+        fi
+
+        echo "Repository cloned successfully"
+
+---
+# -----------------------------------------------------------------------------
+# ClusterTask 2: build-image
+# Equivalent to Argo's "build-image" template
+# -----------------------------------------------------------------------------
+apiVersion: tekton.dev/v1
+kind: ClusterTask
+metadata:
+  name: docker-build-image
+spec:
+  params:
+    - name: image-name
+      type: string
+    - name: image-tag
+      type: string
+    - name: git-revision
+      type: string
+      description: "Received from checkout-source task's result"
+    - name: docker-context
+      type: string
+      default: "."
+    - name: dockerfile-path
+      type: string
+      default: "./Dockerfile"
+  workspaces:
+    - name: source
+      description: Shared workspace with checked-out source
+  steps:
+    - name: build
+      image: ghcr.io/openchoreo/podman-runner:v1.0
+      securityContext:
+        privileged: true
+      script: |
+        #!/bin/sh
+        set -e
+
+        WORKDIR=$(workspaces.source.path)/source
+        IMAGE="$(params.image-name):$(params.image-tag)-$(params.git-revision)"
+        DOCKER_CONTEXT="$(params.docker-context)"
+        DOCKERFILE_PATH="$(params.dockerfile-path)"
+
+        mkdir -p /etc/containers
+        cat > /etc/containers/storage.conf <<EOF
+        [storage]
+        driver = "overlay"
+        runroot = "/run/containers/storage"
+        graphroot = "/var/lib/containers/storage"
+        [storage.options.overlay]
+        mount_program = "/usr/bin/fuse-overlayfs"
+        EOF
+
+        podman build -t $IMAGE -f $WORKDIR/$DOCKERFILE_PATH $WORKDIR/$DOCKER_CONTEXT
+        podman save -o $(workspaces.source.path)/app-image.tar $IMAGE
+
+---
+# -----------------------------------------------------------------------------
+# ClusterTask 3: publish-image
+# Equivalent to Argo's "publish-image" template
+# -----------------------------------------------------------------------------
+apiVersion: tekton.dev/v1
+kind: ClusterTask
+metadata:
+  name: publish-image
+spec:
+  params:
+    - name: image-name
+      type: string
+    - name: image-tag
+      type: string
+    - name: git-revision
+      type: string
+    - name: registry-push-secret
+      type: string
+      default: ""
+  # This task produces an output that the next task consumes
+  results:
+    - name: image
+      description: Full registry image reference (e.g. registry/name:tag)
+  workspaces:
+    - name: source
+  volumes:
+    - name: registry-push-secret
+      secret:
+        secretName: $(params.registry-push-secret)
+        optional: true
+  steps:
+    - name: push
+      image: ghcr.io/openchoreo/podman-runner:v1.0
+      securityContext:
+        privileged: true
+      volumeMounts:
+        - name: registry-push-secret
+          mountPath: /etc/secrets/registry-push-secret
+          readOnly: true
+      script: |
+        #!/bin/sh
+        set -e
+
+        GIT_REVISION=$(params.git-revision)
+        IMAGE_NAME=$(params.image-name)
+        IMAGE_TAG=$(params.image-tag)
+        SRC_IMAGE="${IMAGE_NAME}:${IMAGE_TAG}-${GIT_REVISION}"
+
+        REGISTRY_ENDPOINT="host.k3d.internal:10082"
+        AUTH_FILE="/etc/secrets/registry-push-secret/.dockerconfigjson"
+
+        mkdir -p /etc/containers
+        cat <<EOF > /etc/containers/storage.conf
+        [storage]
+        driver = "overlay"
+        runroot = "/run/containers/storage"
+        graphroot = "/var/lib/containers/storage"
+        [storage.options.overlay]
+        mount_program = "/usr/bin/fuse-overlayfs"
+        EOF
+
+        podman load -i $(workspaces.source.path)/app-image.tar
+        podman tag $SRC_IMAGE $REGISTRY_ENDPOINT/$SRC_IMAGE
+
+        if [ -f "$AUTH_FILE" ]; then
+          podman push --tls-verify=false --authfile "$AUTH_FILE" $REGISTRY_ENDPOINT/$SRC_IMAGE
+        else
+          podman push --tls-verify=false $REGISTRY_ENDPOINT/$SRC_IMAGE
+        fi
+
+        # Write result — Tekton equivalent of Argo's outputs.parameters.valueFrom.path
+        echo -n "$REGISTRY_ENDPOINT/$SRC_IMAGE" > $(results.image.path)
+
+---
+# -----------------------------------------------------------------------------
+# ClusterTask 4: generate-workload-cr
+# Equivalent to Argo's "generate-workload-cr" template
+# -----------------------------------------------------------------------------
+apiVersion: tekton.dev/v1
+kind: ClusterTask
+metadata:
+  name: generate-workload
+spec:
+  params:
+    - name: image
+      type: string
+      description: "Received from publish-image task's result"
+    - name: project-name
+      type: string
+    - name: component-name
+      type: string
+    - name: app-path
+      type: string
+      default: "."
+  results:
+    - name: workload-cr
+      description: Generated workload CR YAML
+  workspaces:
+    - name: source
+  steps:
+    - name: generate
+      image: ghcr.io/openchoreo/podman-runner:v1.0
+      securityContext:
+        privileged: true
+      script: |
+        #!/bin/sh
+        set -e
+
+        IMAGE=$(params.image)
+        PROJECT_NAME=$(params.project-name)
+        COMPONENT_NAME=$(params.component-name)
+        APP_PATH="$(params.app-path)"
+
+        DESCRIPTOR_PATH="$(workspaces.source.path)/source${APP_PATH:+/${APP_PATH#/}}"
+        OUTPUT_PATH="$(workspaces.source.path)/workload-cr.yaml"
+
+        mkdir -p /etc/containers
+        cat <<EOF > /etc/containers/storage.conf
+        [storage]
+        driver = "overlay"
+        runroot = "/run/containers/storage"
+        graphroot = "/var/lib/containers/storage"
+        [storage.options.overlay]
+        mount_program = "/usr/bin/fuse-overlayfs"
+        EOF
+
+        if [ -f "${DESCRIPTOR_PATH}/workload.yaml" ]; then
+          podman run --rm --network=none \
+            -v $DESCRIPTOR_PATH:/app:rw -w /app \
+            ghcr.io/openchoreo/openchoreo-cli:latest-dev \
+            workload create \
+            --project "${PROJECT_NAME}" \
+            --component "${COMPONENT_NAME}" \
+            --image "${IMAGE}" \
+            --descriptor "workload.yaml" \
+            -o "workload-cr.yaml"
+        else
+          podman run --rm --network=none \
+            -v $DESCRIPTOR_PATH:/app:rw -w /app \
+            ghcr.io/openchoreo/openchoreo-cli:latest-dev \
+            workload create \
+            --project "${PROJECT_NAME}" \
+            --component "${COMPONENT_NAME}" \
+            --image "${IMAGE}" \
+            -o "workload-cr.yaml"
+        fi
+
+        cp -f "${DESCRIPTOR_PATH}/workload-cr.yaml" "${OUTPUT_PATH}"
+        # NOTE: Tekton results have a 4096-byte limit.
+        # For large outputs, use a workspace file instead and read it downstream.
+        cat "${OUTPUT_PATH}" > $(results.workload-cr.path)
+
+---
+# -----------------------------------------------------------------------------
+# Pipeline: docker-build-pipeline
+# Equivalent to the Argo ClusterWorkflowTemplate's "entrypoint" DAG/steps
+# This defines the task ordering and how outputs flow between tasks.
+# -----------------------------------------------------------------------------
+apiVersion: tekton.dev/v1
+kind: Pipeline
+metadata:
+  name: docker-build-pipeline
+spec:
+  params:
+    - name: component-name
+      type: string
+    - name: project-name
+      type: string
+    - name: git-repo
+      type: string
+    - name: branch
+      type: string
+      default: main
+    - name: commit
+      type: string
+      default: ""
+    - name: app-path
+      type: string
+      default: "."
+    - name: image-name
+      type: string
+    - name: image-tag
+      type: string
+      default: v1
+    - name: docker-context
+      type: string
+      default: "."
+    - name: dockerfile-path
+      type: string
+      default: "./Dockerfile"
+    - name: git-secret
+      type: string
+      default: ""
+    - name: registry-push-secret
+      type: string
+      default: ""
+  # Pipeline-level results — surfaces task outputs to the PipelineRun status
+  results:
+    - name: image
+      description: Published image reference
+      value: $(tasks.publish-image.results.image)
+    - name: workload-cr
+      description: Generated workload CR
+      value: $(tasks.generate-workload-cr.results.workload-cr)
+  workspaces:
+    - name: shared-workspace
+  tasks:
+    # Step 1: checkout-source
+    - name: checkout-source
+      taskRef:
+        name: checkout-source
+        kind: ClusterTask
+      params:
+        - name: branch
+          value: $(params.branch)
+        - name: git-repo
+          value: $(params.git-repo)
+        - name: commit
+          value: $(params.commit)
+        - name: git-secret
+          value: $(params.git-secret)
+      workspaces:
+        - name: source
+          workspace: shared-workspace
+
+    # Step 2: build-image (runs after checkout-source)
+    - name: build-image
+      runAfter:
+        - checkout-source
+      taskRef:
+        name: docker-build-image
+        kind: ClusterTask
+      params:
+        - name: image-name
+          value: $(params.image-name)
+        - name: image-tag
+          value: $(params.image-tag)
+        # === OUTPUT PASSING ===
+        # This is how Tekton passes outputs between tasks.
+        # Argo:   {{steps.checkout-source.outputs.parameters.git-revision}}
+        # Tekton: $(tasks.checkout-source.results.git-revision)
+        - name: git-revision
+          value: $(tasks.checkout-source.results.git-revision)
+        - name: docker-context
+          value: $(params.docker-context)
+        - name: dockerfile-path
+          value: $(params.dockerfile-path)
+      workspaces:
+        - name: source
+          workspace: shared-workspace
+
+    # Step 3: publish-image (runs after build-image)
+    - name: publish-image
+      runAfter:
+        - build-image
+      taskRef:
+        name: publish-image
+        kind: ClusterTask
+      params:
+        - name: image-name
+          value: $(params.image-name)
+        - name: image-tag
+          value: $(params.image-tag)
+        - name: git-revision
+          value: $(tasks.checkout-source.results.git-revision)
+        - name: registry-push-secret
+          value: $(params.registry-push-secret)
+      workspaces:
+        - name: source
+          workspace: shared-workspace
+
+    # Step 4: generate-workload-cr (runs after publish-image)
+    - name: generate-workload-cr
+      runAfter:
+        - publish-image
+      taskRef:
+        name: generate-workload
+        kind: ClusterTask
+      params:
+        # === OUTPUT PASSING (cross-task) ===
+        # Consuming publish-image's result:
+        # Argo:   {{steps.publish-image.outputs.parameters.image}}
+        # Tekton: $(tasks.publish-image.results.image)
+        - name: image
+          value: $(tasks.publish-image.results.image)
+        - name: project-name
+          value: $(params.project-name)
+        - name: component-name
+          value: $(params.component-name)
+        - name: app-path
+          value: $(params.app-path)
+      workspaces:
+        - name: source
+          workspace: shared-workspace
+
+---
+# -----------------------------------------------------------------------------
+# PipelineRun: Equivalent to the Argo Workflow resource itself
+# This is what actually gets created to trigger execution.
+# -----------------------------------------------------------------------------
+apiVersion: tekton.dev/v1
+kind: PipelineRun
+metadata:
+  name: docker-build-run
+  namespace: openchoreo-ci-example
+spec:
+  pipelineRef:
+    name: docker-build-pipeline
+  params:
+    - name: component-name
+      value: aaaa
+    - name: project-name
+      value: bbb
+    - name: git-repo
+      value: ccc
+    - name: branch
+      value: main
+    - name: commit
+      value: klj12131
+    - name: app-path
+      value: go-greeter
+    - name: image-name
+      value: greeter-service-image
+    - name: image-tag
+      value: v1
+    - name: git-secret
+      value: test-run-git-secret
+    - name: registry-push-secret
+      value: registry-push-secret
+  taskRunTemplate:
+    serviceAccountName: workflow-sa
+  workspaces:
+    - name: shared-workspace
+      volumeClaimTemplate:
+        spec:
+          accessModes:
+            - ReadWriteOnce
+          resources:
+            requests:
+              storage: 2Gi
+  # Tekton equivalent of Argo's ttlStrategy
+  # PipelineRuns are cleaned up via Tekton's results API or a CronJob
+
+In the proposal, task/result are used which are engine-agnostic names.
+
+- task: the Argo step name
+- result: the Argo output parameter name produced by that task
+
+Complete Argo example (steps) showing the exact mapping:
+
+apiVersion: argoproj.io/v1alpha1
+kind: Workflow
+spec:
+  entrypoint: build
+  templates:
+    - name: build
+      steps:
+        - - name: publish-image  # Step 1: Publish Image
+            template: publish-image
+        - - name: generate-workload-cr # Step 2: Generate Workload CR, depends on publish-image
+            template: generate-workload-cr
+            arguments:
+              parameters:
+                - name: image        # This parameter consumes the output of publish-image
+                  value: "{{steps.publish-image.outputs.parameters.image}}"
+
+    - name: publish-image # Step 1: Publish Image
+      container:
+        image: alpine
+        command: [sh, -c]
+        args: ['echo -n "ghcr.io/acme/app:v1" > /tmp/image.txt']
+      outputs:           # Outputs of publish-image step
+        parameters:
+          - name: image  # This is the name of the output parameter
+            valueFrom:
+              path: /tmp/image.txt
+
+So in OpenChoreo terms this is:
+
+kind: Workflow
+spec:
+  results:
+    - name: image  # Name of the output parameters that will be visible in the workflowRun status
+      description: ""
+      valueFrom:
+        taskResult:
+          task: publish-image  # Argo step name that produces the output
+          result: image        # Name of the output parameter defined in the publish-image step
+
+kind: WorkflowRun
+status:
+  results:
+    - name: image                           # Name of the output parameter defined in the Workflow spec
+      value: "default-greeting-service:v1"  # Value of the output parameter
+
+
+In Tekton, they don't use steps or outputs wordings for different tasks. Instead, they have Tasks and Results.
+- task → the Pipeline task name which is similar to argo step
+- result → Tekton Task result name which is similar to argo step output
+
+# Tekton Pipeline task name is "publish-image"
+apiVersion: tekton.dev/v1
+kind: Pipeline
+metadata:
+  name: docker-build-pipeline
+spec:
+  params:
+    - name: component-name
+      type: string
+    - name: image-name
+      type: string
+    - name: registry-push-secret
+      type: string
+      default: ""
+  # Results of different tasks
+  results:
+    - name: image
+      description: Published image reference
+      value: $(tasks.publish-image.results.image)
+    - name: workload-cr
+      description: Generated workload CR
+      value: $(tasks.generate-workload-cr.results.workload-cr)
+  workspaces:
+    - name: shared-workspace
+  tasks:
+    # Step 1: checkout-source
+    - name: checkout-source
+      taskRef:
+        name: checkout-source
+        kind: ClusterTask
+      params:
+        - name: branch
+          value: $(params.branch)
+        - name: git-repo
+          value: $(params.git-repo)
+        - name: commit
+          value: $(params.commit)
+        - name: git-secret
+          value: $(params.git-secret)
+      workspaces:
+        - name: source
+          workspace: shared-workspace
+
+    # Step 2: build-image (runs after checkout-source)
+    - name: build-image
+      runAfter:
+        - checkout-source
+      taskRef:
+        name: docker-build-image
+        kind: ClusterTask
+      params:
+        - name: image-name
+          value: $(params.image-name)
+        - name: image-tag
+          value: $(params.image-tag)
+        # === OUTPUT PASSING ===
+        # This is how Tekton passes outputs between tasks.
+        # Argo:   {{steps.checkout-source.outputs.parameters.git-revision}}
+        # Tekton: $(tasks.checkout-source.results.git-revision)
+        - name: git-revision
+          value: $(tasks.checkout-source.results.git-revision)
+        - name: docker-context
+          value: $(params.docker-context)
+        - name: dockerfile-path
+          value: $(params.dockerfile-path)
+      workspaces:
+        - name: source
+          workspace: shared-workspace
+
+    # Step 3: publish-image (runs after build-image)
+    - name: publish-image
+      runAfter:
+        - build-image
+      taskRef:
+        name: publish-image
+        kind: ClusterTask
+      params:
+        - name: image-name
+          value: $(params.image-name)
+      workspaces:
+        - name: source
+          workspace: shared-workspace
+
+
